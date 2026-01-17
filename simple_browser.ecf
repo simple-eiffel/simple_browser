@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="ISO-8859-1"?>
+<system xmlns="http://www.eiffel.com/developers/xml/configuration-1-23-0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.eiffel.com/developers/xml/configuration-1-23-0 http://www.eiffel.com/developers/xml/configuration-1-23-0.xsd" name="simple_browser" uuid="B8F3E2D1-4A5C-6B7D-8E9F-0A1B2C3D4E5F" library_target="simple_browser_vision">
+	<description>simple_browser - Embedded browser widget using webview/webview</description>
+
+	<!-- ============================================================ -->
+	<!-- BASE TARGET: Core browser abstraction                        -->
+	<!-- ============================================================ -->
+	<target name="simple_browser">
+		<root all_classes="true"/>
+		<option warning="warning" syntax="provisional" manifest_array_type="mismatch_warning">
+			<assertions precondition="true" postcondition="true" check="true" invariant="true" loop="true" supplier_precondition="true"/>
+		</option>
+		<setting name="console_application" value="false"/>
+		<setting name="dead_code_removal" value="feature"/>
+		<capability>
+			<concurrency support="scoop"/>
+			<void_safety support="all"/>
+		</capability>
+
+		<!-- External C includes -->
+		<external_include location="$(SIMPLE_EIFFEL)\simple_browser\Clib"/>
+
+		<!-- Windows libraries -->
+		<external_object location="$(SIMPLE_EIFFEL)\simple_browser\lib\webview.lib">
+			<condition>
+				<platform value="windows"/>
+			</condition>
+		</external_object>
+
+		<!-- Windows system libraries for WebView2 -->
+		<external_linker_flag value="user32.lib ole32.lib oleaut32.lib shlwapi.lib version.lib">
+			<condition>
+				<platform value="windows"/>
+			</condition>
+		</external_linker_flag>
+
+		<!-- Dependencies -->
+		<library name="base" location="$ISE_LIBRARY\library\base\base.ecf"/>
+		<library name="simple_json" location="$SIMPLE_EIFFEL\simple_json\simple_json.ecf"/>
+
+		<!-- Core source -->
+		<cluster name="core" location=".\src\core\"/>
+		<cluster name="quick" location=".\src\quick\"/>
+	</target>
+
+	<!-- ============================================================ -->
+	<!-- VISION TARGET: Integration with simple_vision                -->
+	<!-- ============================================================ -->
+	<target name="simple_browser_vision" extends="simple_browser">
+		<library name="simple_vision" location="$SIMPLE_EIFFEL\simple_vision\simple_vision.ecf"/>
+		<library name="vision2" location="$ISE_LIBRARY\library\vision2\vision2.ecf"/>
+		<library name="wel" location="$ISE_LIBRARY\library\wel\wel.ecf">
+			<condition>
+				<platform value="windows"/>
+			</condition>
+		</library>
+		<cluster name="widget" location=".\src\widget\"/>
+	</target>
+
+	<!-- ============================================================ -->
+	<!-- WEB TARGET: Full stack with simple_web/htmx/alpine           -->
+	<!-- ============================================================ -->
+	<target name="simple_browser_web" extends="simple_browser_vision">
+		<library name="simple_web" location="$SIMPLE_EIFFEL\simple_web\simple_web.ecf"/>
+		<library name="simple_htmx" location="$SIMPLE_EIFFEL\simple_htmx\simple_htmx.ecf"/>
+		<library name="simple_alpine" location="$SIMPLE_EIFFEL\simple_alpine\simple_alpine.ecf"/>
+	</target>
+
+	<!-- ============================================================ -->
+	<!-- TEST TARGET                                                  -->
+	<!-- ============================================================ -->
+	<target name="lib_tests" extends="simple_browser">
+		<root class="LIB_TESTS" feature="make"/>
+		<setting name="console_application" value="true"/>
+		<library name="simple_testing" location="$SIMPLE_EIFFEL\simple_testing\simple_testing.ecf"/>
+		<library name="testing" location="$ISE_LIBRARY\library\testing\testing.ecf"/>
+		<cluster name="testing" location=".\testing\"/>
+	</target>
+
+	<!-- ============================================================ -->
+	<!-- DEMO TARGETS                                                 -->
+	<!-- ============================================================ -->
+	<target name="demo_basic" extends="simple_browser">
+		<root class="DEMO_BASIC" feature="make"/>
+		<setting name="console_application" value="false"/>
+		<cluster name="demos" location=".\demos\"/>
+	</target>
+
+	<target name="demo_embedded" extends="simple_browser_vision">
+		<root class="DEMO_EMBEDDED" feature="make"/>
+		<setting name="console_application" value="false"/>
+		<cluster name="demos" location=".\demos\"/>
+	</target>
+
+	<target name="demo_voxcraft_ui" extends="simple_browser_web">
+		<root class="DEMO_VOXCRAFT_UI" feature="make"/>
+		<setting name="console_application" value="false"/>
+		<cluster name="demos" location=".\demos\"/>
+	</target>
+
+</system>
