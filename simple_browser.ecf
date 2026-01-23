@@ -70,11 +70,11 @@
 	<!-- TEST TARGET                                                  -->
 	<!-- ============================================================ -->
 	<target name="lib_tests" extends="simple_browser">
-		<root class="LIB_TESTS" feature="make"/>
+		<root class="TEST_APP" feature="make"/>
 		<setting name="console_application" value="true"/>
 		<library name="simple_testing" location="$SIMPLE_EIFFEL\simple_testing\simple_testing.ecf"/>
 		<library name="testing" location="$ISE_LIBRARY\library\testing\testing.ecf"/>
-		<cluster name="testing" location=".\testing\"/>
+		<cluster name="tests" location=".\testing\"/>
 	</target>
 
 	<!-- ============================================================ -->
