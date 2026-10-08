@@ -92,10 +92,4 @@
 		<cluster name="demos" location=".\demos\"/>
 	</target>
 
-	<target name="demo_voxcraft_ui" extends="simple_browser_web">
-		<root class="DEMO_VOXCRAFT_UI" feature="make"/>
-		<setting name="console_application" value="false"/>
-		<cluster name="demos" location=".\demos\"/>
-	</target>
-
 </system>
