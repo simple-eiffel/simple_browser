@@ -34,6 +34,8 @@ feature {NONE} -- Test Runners
 		do
 			create lib_tests
 			run_test (agent lib_tests.test_creation, "test_creation")
+			run_test (agent lib_tests.test_binding_round_trip, "test_binding_round_trip")
+			run_test (agent lib_tests.test_gc_runs_while_the_window_loop_runs, "test_gc_runs_while_the_window_loop_runs")
 		end
 
 feature {NONE} -- Implementation

@@ -45,8 +45,15 @@
  * We store up to 32 named bindings with their associated Eiffel callbacks.
  * The arg parameter to webview_bind contains the binding index.
  *
- * IMPORTANT: We use eif_adopt() to protect Eiffel objects from GC movement.
- * This is critical for finalized code where GC is more aggressive.
+ * Each binding holds its Eiffel object through a protected handle
+ * (eif_protect), so the reference stays valid when the GC moves the object.
+ *
+ * webview_run is a `blocking' external: while the message loop runs, this
+ * thread is outside Eiffel code and the GC collects (and moves objects)
+ * without waiting for it - which is what lets other SCOOP processors or
+ * threads collect at all. A callback therefore re-enters Eiffel code
+ * (EIF_EXIT_C) before touching any Eiffel object and leaves it again
+ * (EIF_ENTER_C) before handing control back to the loop.
  */
 
 #define MAX_BINDINGS 32
@@ -57,7 +64,7 @@ typedef void (*eiffel_callback_t)(void* eiffel_object, const char* name, const c
 /* Binding entry */
 typedef struct {
     char name[64];
-    void* eiffel_object;        /* Raw Eiffel object pointer (GC protection via eif_adopt didn't work) */
+    EIF_OBJECT eiffel_object;   /* Protected handle (eif_protect): follows the object when the GC moves it */
     eiffel_callback_t callback; /* Eiffel dispatch function */
     int in_use;
 } webview_binding_t;
@@ -83,9 +90,8 @@ static int webview_register_binding(const char* name, void* eiffel_obj, eiffel_c
         if (!g_bindings[i].in_use) {
             strncpy(g_bindings[i].name, name, 63);
             g_bindings[i].name[63] = '\0';
-            /* Store raw pointer AND protect with eif_adopt */
-            /* The raw pointer is used directly - risky but eif_access returns NULL */
-            g_bindings[i].eiffel_object = eiffel_obj;
+            /* Called from Eiffel code (non-blocking external), so the reference is current */
+            g_bindings[i].eiffel_object = eif_protect((EIF_REFERENCE) eiffel_obj);
             g_bindings[i].callback = cb;
             g_bindings[i].in_use = 1;
             if (dbg) {
@@ -105,6 +111,9 @@ static void webview_unregister_binding(const char* name) {
     int i;
     for (i = 0; i < MAX_BINDINGS; i++) {
         if (g_bindings[i].in_use && strcmp(g_bindings[i].name, name) == 0) {
+            if (g_bindings[i].eiffel_object != NULL) {
+                eif_wean(g_bindings[i].eiffel_object);
+            }
             g_bindings[i].eiffel_object = NULL;
             g_bindings[i].in_use = 0;
             break;
@@ -116,7 +125,7 @@ static void webview_unregister_binding(const char* name) {
 static void webview_callback_trampoline(const char* seq, const char* req, void* arg) {
     int index = (int)(intptr_t)arg;
     FILE* dbg = fopen("webview_debug.log", "a");
-    char gc_was_enabled = 0;
+    int was_in_eiffel;
 
     if (dbg) {
         fprintf(dbg, "TRAMPOLINE: index=%d seq=%s req=%.50s\n", index, seq ? seq : "NULL", req ? req : "NULL");
@@ -129,11 +138,10 @@ static void webview_callback_trampoline(const char* seq, const char* req, void* 
             fflush(dbg);
         }
         if (g_bindings[index].callback != NULL && g_bindings[index].eiffel_object != NULL) {
-            /* Disable GC during callback to prevent object movement */
-            gc_was_enabled = eif_gc_ison();
-            if (gc_was_enabled) {
-                eif_gc_stop();
-                if (dbg) { fprintf(dbg, "  GC disabled\n"); fflush(dbg); }
+            /* Back into Eiffel code: waits for a collection in progress to finish */
+            was_in_eiffel = EIF_IS_IN_EIFFEL_CODE;
+            if (!was_in_eiffel) {
+                EIF_EXIT_C;
             }
 
             if (dbg) {
@@ -143,17 +151,16 @@ static void webview_callback_trampoline(const char* seq, const char* req, void* 
             }
             /* Call Eiffel: ABI expects (Current, a_name, a_seq, a_req) */
             g_bindings[index].callback(
-                g_bindings[index].eiffel_object,
+                eif_access(g_bindings[index].eiffel_object),
                 g_bindings[index].name,
                 seq,
                 req
             );
             if (dbg) { fprintf(dbg, "DISPATCH DONE\n"); fflush(dbg); }
 
-            /* Re-enable GC if it was enabled before */
-            if (gc_was_enabled) {
-                eif_gc_run();
-                if (dbg) { fprintf(dbg, "  GC re-enabled\n"); fflush(dbg); }
+            /* Out of Eiffel code again, back to the message loop */
+            if (!was_in_eiffel) {
+                EIF_ENTER_C;
             }
         } else {
             if (dbg) { fprintf(dbg, "SKIP: callback=%p obj=%p\n",

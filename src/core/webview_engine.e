@@ -326,8 +326,12 @@ feature {NONE} -- C Externals
 	c_webview_run (a_w: POINTER): INTEGER
 			-- Run event loop.
 			-- Returns 0 on success.
+			-- `blocking': the loop runs for the window's whole life, and a thread
+			-- the runtime counts as inside Eiffel code would make every other
+			-- processor's garbage collection wait for it forever. Callbacks
+			-- re-enter Eiffel code in the C trampoline (webview_wrapper.h).
 		external
-			"C (void*): int | %"webview_wrapper.h%""
+			"C blocking signature (void*): int use %"webview_wrapper.h%""
 		alias
 			"webview_run"
 		end
