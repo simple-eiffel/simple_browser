@@ -2,6 +2,10 @@
 
 ## [Unreleased] - 2026-10-08
 
+### Changed
+- 2026-10-26: the `simple_browser_vision` target no longer lists ISE `wel`; nothing used it (clean build of
+  demo_embedded, zero warnings).
+
 ### Fixed
 - **A SCOOP or multi-threaded program froze the first time any other processor collected garbage while the
   window was open.** `webview_run` (the window's message loop, which runs for the window's whole life) was an
