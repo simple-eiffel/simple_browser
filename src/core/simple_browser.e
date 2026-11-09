@@ -21,7 +21,6 @@ note
 		Threading:
 			The `run` method blocks. For non-blocking operation:
 			- Use SCOOP processor
-			- Or use with simple_vision widget (SB_WIDGET)
 	]"
 	author: "Larry Rix"
 	date: "$Date$"

@@ -2,6 +2,11 @@
 
 ## [Unreleased] - 2026-10-08
 
+### Removed
+- 2026-11-09: `SB_WIDGET` (the browser embedded in a simple_vision window), its `simple_browser_vision` target
+  and the `demo_embedded` demo, because simple_vision is being retired. The library target is now
+  `simple_browser`: the standalone browser window, unchanged. `simple_browser_web` extends it directly.
+
 ### Changed
 - 2026-10-26: the `simple_browser_vision` target no longer lists ISE `wel`; nothing used it (clean build of
   demo_embedded, zero warnings).
