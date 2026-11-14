@@ -49,6 +49,7 @@ void sb_decide(int e, int a_decision, int a_allow);
    `sb_next' takes the oldest; its texts stay readable through `sb_text' until the next `sb_next'. */
 int sb_pump(int a_ms);
 int sb_next(int *a_kind, int *an_engine, int *a, int *b, int *c);
+int sb_next_for(int an_engine, int *a_kind, int *a, int *b, int *c);   /* engine `an_engine''s oldest */
 const char *sb_text(int i);
 int sb_text_length(int i);
 void sb_terminate(int e);   /* queues `closed' for `e' (the loop ends), the window stays until destroyed */

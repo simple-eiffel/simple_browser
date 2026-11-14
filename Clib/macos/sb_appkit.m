@@ -461,11 +461,27 @@ int sb_pump(int a_ms)
 	return [s_queue count] > 0 ? 1 : 0;
 }
 
+static int sb_take(NSUInteger i, int *a_kind, int *an_engine, int *a, int *b, int *c);
+
 int sb_next(int *a_kind, int *an_engine, int *a, int *b, int *c)
 {
-	if ([s_queue count] == 0) return 0;
-	SBEvent *e = s_queue[0];
-	[s_queue removeObjectAtIndex:0];
+	return [s_queue count] > 0 ? sb_take(0, a_kind, an_engine, a, b, c) : 0;
+}
+
+/* The oldest event of engine `e' (each engine's loop takes its own; two browsers in one process
+   don't take each other's). */
+int sb_next_for(int an_engine, int *a_kind, int *a, int *b, int *c)
+{
+	int l_engine;
+	for (NSUInteger i = 0; i < [s_queue count]; i++)
+		if (s_queue[i]->engine == an_engine) return sb_take(i, a_kind, &l_engine, a, b, c);
+	return 0;
+}
+
+static int sb_take(NSUInteger i, int *a_kind, int *an_engine, int *a, int *b, int *c)
+{
+	SBEvent *e = s_queue[i];
+	[s_queue removeObjectAtIndex:i];
 	*a_kind = e->kind; *an_engine = e->engine; *a = e->a; *b = e->b; *c = e->c;
 	for (int i = 0; i < 3; i++) {
 		NSMutableData *d = [[e->text[i] dataUsingEncoding:NSUTF8StringEncoding] mutableCopy] ?: [NSMutableData data];
