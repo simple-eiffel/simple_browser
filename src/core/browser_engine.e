@@ -53,11 +53,25 @@ feature -- Navigation
 		end
 
 	set_html (a_html: READABLE_STRING_GENERAL)
-			-- Load `a_html' as the page. The program's own load is never asked.
+			-- Load `a_html' as the page, at `new_set_html_base' (SB_SCRIPTS.set_html_base), so
+			-- its origin is SB_SCRIPTS.Set_html_origin on every platform. The program's own load
+			-- is never asked.
 		require
 			valid: is_valid
 		deferred
 		end
+
+	new_set_html_base: STRING_8
+			-- The URL for the next `set_html' page; each call numbers a new one.
+		do
+			set_html_pages := set_html_pages + 1
+			Result := shared_scripts.set_html_base (set_html_pages)
+		ensure
+			numbered: set_html_pages = old set_html_pages + 1
+		end
+
+	set_html_pages: INTEGER
+			-- How many `set_html' pages this engine has numbered.
 
 feature -- Window configuration
 
@@ -273,6 +287,15 @@ feature -- Test hooks
 		deferred
 		end
 
+	test_echo_at (a_url: READABLE_STRING_GENERAL)
+			-- Answer every request for `a_url' with a page whose element `echo' shows the
+			-- request's method, a line break, then its body (a form's fields, as sent).
+		require
+			valid: is_valid
+			url_not_empty: not a_url.is_empty
+		deferred
+		end
+
 feature -- Queries
 
 	is_json_text (a_text: READABLE_STRING_8): BOOLEAN
@@ -338,6 +361,12 @@ feature -- Event kinds
 
 feature {NONE} -- Implementation
 
+	shared_scripts: SB_SCRIPTS
+			-- The shared script texts and page URLs.
+		once
+			create Result
+		end
+
 	event_texts: ARRAY [STRING_8]
 			-- The texts of the event last taken.
 		attribute
@@ -366,5 +395,6 @@ feature {NONE} -- Implementation
 
 invariant
 	three_texts: event_texts.count = 3 and event_texts.lower = 1
+	pages_counted: set_html_pages >= 0
 
 end
