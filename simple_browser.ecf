@@ -26,6 +26,23 @@
 			</condition>
 		</external_include>
 
+		<!-- Linux: the GTK engine's header (Clib/linux), WebKitGTK 6.0 on GTK 4 -->
+		<external_include location="$(SIMPLE_EIFFEL)/simple_browser/Clib/linux">
+			<condition>
+				<platform value="unix"/>
+			</condition>
+		</external_include>
+		<external_cflag value="`pkg-config --cflags webkitgtk-6.0`">
+			<condition>
+				<platform value="unix"/>
+			</condition>
+		</external_cflag>
+		<external_linker_flag value="`pkg-config --libs webkitgtk-6.0`">
+			<condition>
+				<platform value="unix"/>
+			</condition>
+		</external_linker_flag>
+
 		<!-- Windows libraries -->
 		<external_object location="$(SIMPLE_EIFFEL)\simple_browser\lib\webview.lib">
 			<condition>
@@ -51,6 +68,11 @@
 		<cluster name="windows" location=".\src\windows\">
 			<condition>
 				<platform value="windows"/>
+			</condition>
+		</cluster>
+		<cluster name="linux" location=".\src\linux\">
+			<condition>
+				<platform value="unix"/>
 			</condition>
 		</cluster>
 	</target>
