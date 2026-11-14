@@ -49,11 +49,16 @@ feature -- Basic operations
 feature {NONE} -- Implementation
 
 	tick_ms: NATURAL_64
-			-- Milliseconds since system start.
+			-- A millisecond clock, for timing a stretch of work (C11's timespec_get: Windows' UCRT,
+			-- macOS and glibc all have it).
 		external
-			"C inline use <windows.h>"
+			"C inline use <time.h>"
 		alias
-			"return (EIF_NATURAL_64) GetTickCount64();"
+			"[
+				struct timespec l_t;
+				timespec_get (&l_t, TIME_UTC);
+				return (EIF_NATURAL_64) l_t.tv_sec * 1000 + (EIF_NATURAL_64) l_t.tv_nsec / 1000000;
+			]"
 		end
 
 end

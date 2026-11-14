@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="ISO-8859-1"?>
 <system xmlns="http://www.eiffel.com/developers/xml/configuration-1-23-0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.eiffel.com/developers/xml/configuration-1-23-0 http://www.eiffel.com/developers/xml/configuration-1-23-0.xsd" name="simple_browser" uuid="B8F3E2D1-4A5C-6B7D-8E9F-0A1B2C3D4E5F" library_target="simple_browser">
-	<description>simple_browser - Embedded browser widget using webview/webview</description>
+	<description>simple_browser - a browser window for Eiffel programs: WebView2 (Windows), WKWebView (macOS), WebKitGTK (Linux)</description>
 
 	<!-- ============================================================ -->
 	<!-- BASE TARGET: Core browser abstraction                        -->
@@ -17,8 +17,31 @@
 			<void_safety support="all"/>
 		</capability>
 
-		<!-- External C includes -->
+		<!-- External C includes: webview.dll's API (Clib), and the Windows engine's header,
+		     WebView2.h and its one Windows SDK type (Clib/windows) -->
 		<external_include location="$(SIMPLE_EIFFEL)\simple_browser\Clib"/>
+		<external_include location="$(SIMPLE_EIFFEL)\simple_browser\Clib\windows">
+			<condition>
+				<platform value="windows"/>
+			</condition>
+		</external_include>
+
+		<!-- Linux: the GTK engine's header (Clib/linux), WebKitGTK 6.0 on GTK 4 -->
+		<external_include location="$(SIMPLE_EIFFEL)/simple_browser/Clib/linux">
+			<condition>
+				<platform value="unix"/>
+			</condition>
+		</external_include>
+		<external_cflag value="`pkg-config --cflags webkitgtk-6.0`">
+			<condition>
+				<platform value="unix"/>
+			</condition>
+		</external_cflag>
+		<external_linker_flag value="`pkg-config --libs webkitgtk-6.0`">
+			<condition>
+				<platform value="unix"/>
+			</condition>
+		</external_linker_flag>
 
 		<!-- Windows libraries -->
 		<external_object location="$(SIMPLE_EIFFEL)\simple_browser\lib\webview.lib">
@@ -28,9 +51,26 @@
 		</external_object>
 
 		<!-- Windows system libraries for WebView2 -->
-		<external_linker_flag value="user32.lib ole32.lib oleaut32.lib shlwapi.lib version.lib">
+		<external_linker_flag value="user32.lib ole32.lib oleaut32.lib shlwapi.lib version.lib uuid.lib">
 			<condition>
 				<platform value="windows"/>
+			</condition>
+		</external_linker_flag>
+
+		<!-- macOS: the AppKit engine (WKWebView); make -C Clib builds the object -->
+		<external_include location="$(SIMPLE_EIFFEL)/simple_browser/Clib/macos">
+			<condition>
+				<platform value="macintosh"/>
+			</condition>
+		</external_include>
+		<external_object location="$(SIMPLE_EIFFEL)/simple_browser/Clib/sb_appkit.o">
+			<condition>
+				<platform value="macintosh"/>
+			</condition>
+		</external_object>
+		<external_linker_flag value="-framework Cocoa -framework WebKit">
+			<condition>
+				<platform value="macintosh"/>
 			</condition>
 		</external_linker_flag>
 
@@ -38,9 +78,25 @@
 		<library name="base" location="$ISE_LIBRARY\library\base\base.ecf"/>
 		<library name="simple_json" location="$SIMPLE_EIFFEL\simple_json\simple_json.ecf"/>
 
-		<!-- Core source -->
+		<!-- Shared source (every platform) -->
 		<cluster name="core" location=".\src\core\"/>
 		<cluster name="quick" location=".\src\quick\"/>
+		<!-- Each platform's engine and SB_PLATFORM -->
+		<cluster name="windows" location=".\src\windows\">
+			<condition>
+				<platform value="windows"/>
+			</condition>
+		</cluster>
+		<cluster name="linux" location=".\src\linux\">
+			<condition>
+				<platform value="unix"/>
+			</condition>
+		</cluster>
+		<cluster name="macos" location=".\src\macos\">
+			<condition>
+				<platform value="macintosh"/>
+			</condition>
+		</cluster>
 	</target>
 
 	<!-- ============================================================ -->
