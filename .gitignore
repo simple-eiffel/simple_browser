@@ -2,3 +2,4 @@ EIFGENs/
 *.log
 *.melted
 *.epr
+Clib/*.o
