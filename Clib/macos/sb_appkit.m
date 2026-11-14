@@ -9,6 +9,7 @@
 #import <Cocoa/Cocoa.h>
 #import <WebKit/WebKit.h>
 #include <pthread.h>
+#include <float.h>
 #include "sb_appkit.h"
 
 /* ---------------------------------------------------------------- the event queue */
@@ -110,6 +111,7 @@ int sb_is_gui_thread(void) { return pthread_main_np() ? 1 : 0; }
 	int next_decision;
 	NSMutableDictionary<NSNumber *, void (^)(WKNavigationActionPolicy)> *held;
 	BOOL load_failed;
+	BOOL fixed;                /* a fixed size: a plain set_size holds to it until a min or max hint */
 }
 - (void)rebuildScripts;
 @end
@@ -303,6 +305,12 @@ void sb_set_size(int an_id, int a_width, int a_height, int a_hint)
 	if (!e || !e->window) return;
 	NSSize s = NSMakeSize(a_width, a_height);
 	NSWindowStyleMask m = [e->window styleMask];
+	if (a_hint == 0 && e->fixed) return;   /* a fixed size holds against a plain set_size */
+	if (a_hint == 1 || a_hint == 2) {
+		/* a limit ends a fixed size: the window can be resized again */
+		e->fixed = NO;
+		if (!(m & NSWindowStyleMaskResizable)) { m |= NSWindowStyleMaskResizable; [e->window setStyleMask:m]; }
+	}
 	switch (a_hint) {
 		case 1: case 2: {
 			/* a new limit applies to the window now, not only to the user's next drag */
@@ -313,7 +321,10 @@ void sb_set_size(int an_id, int a_width, int a_height, int a_hint)
 			break;
 		}
 		case 3:
+			e->fixed = YES;
 			[e->window setStyleMask:m & ~NSWindowStyleMaskResizable];
+			[e->window setContentMinSize:NSMakeSize(0, 0)];
+			[e->window setContentMaxSize:NSMakeSize(FLT_MAX, FLT_MAX)];
 			[e->window setContentSize:s];
 			break;
 		default: {
@@ -494,21 +505,39 @@ static int sb_take(NSUInteger i, int *a_kind, int *an_engine, int *a, int *b, in
 const char *sb_text(int i) { return i >= 1 && i <= 3 && s_current[i - 1] ? (const char *)[s_current[i - 1] bytes] : ""; }
 int sb_text_length(int i) { return i >= 1 && i <= 3 && s_current[i - 1] ? (int)[s_current[i - 1] length] - 1 : 0; }
 
-void sb_terminate(int an_id) { if (sb_engine(an_id)) sb_push(SB_EVENT_CLOSED, an_id, 0, 0, 0, nil, nil, nil); }
+/* The program ends its loop (SIMPLE_BROWSER.close): no event (`closed' is the user's), only a wake,
+   so a pump waiting for one returns at once. */
+void sb_terminate(int an_id)
+{
+	if (!sb_engine(an_id)) return;
+	NSEvent *n = [NSEvent otherEventWithType:NSEventTypeApplicationDefined location:NSZeroPoint
+		modifierFlags:0 timestamp:0 windowNumber:0 context:nil subtype:0 data1:0 data2:0];
+	[NSApp postEvent:n atStart:NO];
+}
 
 /* ---------------------------------------------------------------- tests */
 
-/* Windows on screen that hold a web view: a new-window request must not add one. */
-int sb_test_window_count(void)
+/* This engine's window, if on screen, and any other window on screen holding a web view no engine
+   made (one WebKit opened by itself): a new-window request must never add one. Other engines'
+   windows don't count. */
+static BOOL sb_holds_web_view(NSView *v)
 {
+	NSMutableArray<NSView *> *q = [NSMutableArray arrayWithObject:v ?: [[NSView alloc] init]];
+	while ([q count]) { NSView *x = q[0]; [q removeObjectAtIndex:0]; if ([x isKindOfClass:[WKWebView class]]) return YES; [q addObjectsFromArray:[x subviews]]; }
+	return NO;
+}
+int sb_test_window_count(int an_id)
+{
+	SBEngine *e = sb_engine(an_id);
 	int n = 0;
 	for (NSWindow *w in [NSApp windows]) {
-		if (![w isVisible]) continue;
-		NSMutableArray<NSView *> *q = [NSMutableArray arrayWithObject:[w contentView] ?: [[NSView alloc] init]];
-		BOOL l_has = NO;
-		while ([q count] && !l_has) { NSView *v = q[0]; [q removeObjectAtIndex:0]; if ([v isKindOfClass:[WKWebView class]]) l_has = YES; else [q addObjectsFromArray:[v subviews]]; }
-		if (l_has) n++;
+		if (![w isVisible] || !sb_holds_web_view([w contentView])) continue;
+		BOOL l_ours = NO, l_this = NO;
+		for (int i = 1; i <= SB_MAX_ENGINES; i++)
+			if (s_engines[i] && (s_engines[i]->window == w || [s_engines[i]->view window] == w)) { l_ours = YES; if (i == an_id) l_this = YES; }
+		if (l_this || !l_ours) n++;
 	}
+	(void)e;
 	return n;
 }
 int sb_test_content_width(int an_id) { SBEngine *e = sb_engine(an_id); return e ? (int)lround(NSWidth([e->view bounds])) : 0; }

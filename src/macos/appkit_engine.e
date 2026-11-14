@@ -29,13 +29,7 @@ feature {NONE} -- Initialization
 		require
 			on_the_gui_thread: is_gui_thread
 		do
-			create event_texts.make_filled ("", 1, 3)
 			engine_id := c_create (default_pointer, a_ephemeral, a_debug)
-			if engine_id = 0 then
-				last_error := "Could not create the web view"
-			end
-		ensure
-			ready_or_said_why: is_ready or last_error /= Void
 		end
 
 	make_with_window (a_parent: POINTER; a_ephemeral, a_debug: BOOLEAN)
@@ -44,24 +38,18 @@ feature {NONE} -- Initialization
 			on_the_gui_thread: is_gui_thread
 			parent_given: a_parent /= default_pointer
 		do
-			create event_texts.make_filled ("", 1, 3)
 			engine_id := c_create (a_parent, a_ephemeral, a_debug)
-			if engine_id = 0 then
-				last_error := "Could not create the web view in the parent view"
-			end
-		ensure
-			ready_or_said_why: is_ready or last_error /= Void
 		end
 
 feature -- Status
 
-	is_ready: BOOLEAN
+	is_valid: BOOLEAN
 			-- <Precursor>
 		do
 			Result := engine_id /= 0
 		end
 
-	last_error: detachable STRING_32
+	is_deciding: BOOLEAN
 			-- <Precursor>
 
 	is_gui_thread: BOOLEAN
@@ -77,9 +65,7 @@ feature -- Window access
 	window_handle: POINTER
 			-- <Precursor>: the NSWindow, or the WKWebView when embedded.
 		do
-			if is_ready then
-				Result := c_window (engine_id)
-			end
+			Result := c_window (engine_id)
 		end
 
 feature -- Navigation
@@ -91,9 +77,11 @@ feature -- Navigation
 		end
 
 	set_html (a_html: READABLE_STRING_GENERAL)
-			-- <Precursor>
+			-- <Precursor>: at https://simple-browser.invalid/page-N, a reserved name that never
+			-- reaches the network, so every platform's pages have one https origin.
 		do
-			c_set_html (engine_id, utf_8 (a_html).item, default_pointer)
+			page_serial := page_serial + 1
+			c_set_html (engine_id, utf_8 (a_html).item, utf_8 ("https://simple-browser.invalid/page-" + page_serial.out).item)
 		end
 
 	set_html_with_base (a_html, a_base_url: READABLE_STRING_GENERAL)
@@ -142,13 +130,13 @@ feature -- Scripts
 			c_set_bridge (engine_id, utf_8 (a_script).item)
 		end
 
-	bind_name (a_name: READABLE_STRING_GENERAL; a_line: STRING_8)
+	bind_name (a_name, a_line: STRING_8)
 			-- Binding `a_name', whose page-side line shared code wrote.
 		do
 			c_bind (engine_id, utf_8 (a_name).item, utf_8 (a_line).item)
 		end
 
-	unbind_name (a_name: READABLE_STRING_GENERAL)
+	unbind_name (a_name: STRING_8)
 			-- Binding `a_name' gone from this page and the next.
 		do
 			c_unbind (engine_id, utf_8 (a_name).item)
@@ -174,6 +162,7 @@ feature -- Navigation decisions
 			-- Hold the page's navigations for the program (`a_on'), or allow them at once.
 		do
 			c_set_deciding (engine_id, a_on)
+			is_deciding := a_on
 		end
 
 	decide (a_decision: INTEGER; a_allow: BOOLEAN)
@@ -191,43 +180,26 @@ feature -- The loop
 		end
 
 	next_event: BOOLEAN
-			-- Take this engine's oldest event into `event_kind', `event_a', `event_b', `event_c' and
-			-- `event_texts'; False when none waits.
+			-- <Precursor>
 		local
-			l_kind, l_a, l_b, l_c, i: INTEGER
+			l_kind, l_a, l_b, l_c: INTEGER
 		do
-			if is_ready and then c_next_for (engine_id, $l_kind, $l_a, $l_b, $l_c) then
+			if c_next_for (engine_id, $l_kind, $l_a, $l_b, $l_c) then
 				Result := True
-				event_kind := l_kind
-				event_a := l_a
-				event_b := l_b
-				event_c := l_c
-				from i := 1 until i > 3 loop
-					event_texts [i] := text_of (i)
-					i := i + 1
-				end
+				set_event (l_kind, l_a, l_b, l_c, text_of (1), text_of (2), text_of (3))
 			end
 		end
-
-	event_kind, event_a, event_b, event_c: INTEGER
-			-- The event `next_event' took (4.1): 1 call, 2 evaluated, 3 navigating, 4 new window,
-			-- 5 title changed, 6 loaded, 7 closed.
-
-	event_texts: ARRAY [STRING_32]
-			-- Its texts, 1 to 3.
 
 	terminate
 			-- <Precursor>: the loop ends at its next event.
 		do
-			if is_ready then
-				c_terminate (engine_id)
-			end
+			c_terminate (engine_id)
 		end
 
 	dispose
 			-- <Precursor>: held decisions are refused, the window closes.
 		do
-			if is_ready then
+			if engine_id /= 0 then
 				c_destroy (engine_id)
 				engine_id := 0
 			end
@@ -236,11 +208,9 @@ feature -- The loop
 feature -- Tests
 
 	test_window_count: INTEGER
-			-- Windows on screen holding a web view.
-		external
-			"C inline use %"sb_appkit.h%""
-		alias
-			"return sb_test_window_count();"
+			-- <Precursor>: this engine's window and any web-view window no engine made.
+		do
+			Result := c_window_count (engine_id)
 		end
 
 	test_content_width: INTEGER
@@ -263,19 +233,19 @@ feature {NONE} -- Implementation
 	engine_id: INTEGER
 			-- The C side's engine; 0 none.
 
+	page_serial: INTEGER
+			-- How many pages `set_html' has loaded.
+
 	utf_8 (a_text: READABLE_STRING_GENERAL): C_STRING
 			-- `a_text' as NUL-terminated UTF-8.
 		do
 			create Result.make ({UTF_CONVERTER}.string_32_to_utf_8_string_8 (a_text.to_string_32))
 		end
 
-	text_of (i: INTEGER): STRING_32
-			-- Text `i' of the event taken last, from its UTF-8.
-		local
-			l_utf_8: STRING_8
+	text_of (i: INTEGER): STRING_8
+			-- Text `i' of the event taken last, as its UTF-8 bytes.
 		do
-			create l_utf_8.make_from_c_substring (c_text (i), 1, c_text_length (i))
-			Result := {UTF_CONVERTER}.utf_8_string_8_to_string_32 (l_utf_8)
+			create Result.make_from_c_substring (c_text (i), 1, c_text_length (i))
 		end
 
 feature {NONE} -- C
@@ -347,6 +317,9 @@ feature {NONE} -- C
 
 	c_terminate (e: INTEGER)
 		external "C inline use %"sb_appkit.h%"" alias "sb_terminate($e);" end
+
+	c_window_count (e: INTEGER): INTEGER
+		external "C inline use %"sb_appkit.h%"" alias "return sb_test_window_count($e);" end
 
 	c_content_width (e: INTEGER): INTEGER
 		external "C inline use %"sb_appkit.h%"" alias "return sb_test_content_width($e);" end
