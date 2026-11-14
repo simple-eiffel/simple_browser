@@ -119,6 +119,7 @@ typedef struct {
     int engine;
     ICoreWebView2Frame2 *frame;  /* referenced by us */
     int started;              /* its first navigation (the iframe's own src) is let through */
+    wchar_t *hint_url;        /* where the frame's own link or script last said it is going */
     int pass_pending;         /* replays still to let through */
     UINT64 pass_navigation;
     int pass_valid;
@@ -411,14 +412,56 @@ static ICoreWebView2WebMessageReceivedEventHandlerVtbl sbw_message_vtbl = {
     sbw_on_message
 };
 
-/* An iframe's web message: queued with c = 1 + the frame's slot. */
+static sbw_frame_t *sbw_frame (int a_id, int a_frame);
+
+/* The string value of "url" in the web message `a_json' ({"sb_hint":K,"url":"..."}), or NULL. */
+static wchar_t *sbw_json_url (LPCWSTR a_json) {
+    const wchar_t *l_at = wcsstr (a_json, L"\"url\":\"");
+    wchar_t *l_result;
+    size_t j = 0;
+    unsigned int l_code;
+    if (!l_at) { return NULL; }
+    l_at += 7;
+    l_result = (wchar_t *) malloc (sizeof (wchar_t) * (wcslen (l_at) + 1));
+    if (!l_result) { return NULL; }
+    while (*l_at && *l_at != L'"') {
+        if (*l_at == L'\\' && l_at[1]) {
+            l_at++;
+            switch (*l_at) {
+            case L'n': l_result[j++] = L'\n'; break;
+            case L't': l_result[j++] = L'\t'; break;
+            case L'r': l_result[j++] = L'\r'; break;
+            case L'b': l_result[j++] = L'\b'; break;
+            case L'f': l_result[j++] = L'\f'; break;
+            case L'u':
+                if (swscanf (l_at + 1, L"%4x", &l_code) == 1) { l_result[j++] = (wchar_t) l_code; l_at += 4; }
+                break;
+            default: l_result[j++] = *l_at; break;
+            }
+        } else {
+            l_result[j++] = *l_at;
+        }
+        l_at++;
+    }
+    l_result[j] = 0;
+    return l_result;
+}
+
+/* An iframe's web message: queued with c = 1 + the frame's slot. A navigation hint is also kept
+   as the frame's `hint_url': only a navigation the frame itself reported is asked. */
 SBW_HANDLER_UNKNOWN (ICoreWebView2FrameWebMessageReceivedEventHandler)
 
 static HRESULT STDMETHODCALLTYPE sbw_on_frame_message (ICoreWebView2FrameWebMessageReceivedEventHandler *a_this,
         ICoreWebView2Frame *a_sender, ICoreWebView2WebMessageReceivedEventArgs *a_args) {
     sbw_handler_t *l_self = (sbw_handler_t *) a_this;
+    sbw_frame_t *l_frame;
     LPWSTR l_json = NULL;
     if (SUCCEEDED (ICoreWebView2WebMessageReceivedEventArgs_get_WebMessageAsJson (a_args, &l_json)) && l_json) {
+        if (wcsncmp (l_json, L"{\"sb_hint\":", 11) == 0
+                && (l_frame = sbw_frame (l_self->engine, l_self->extra + 1)) != NULL) {
+            free (l_frame->hint_url);
+            l_frame->hint_url = sbw_json_url (l_json);
+        }
         sbw_push_wide (l_self->engine, SBW_EVENT_MESSAGE, 0, 0, l_self->extra + 1, l_json);
         CoTaskMemFree (l_json);
     }
@@ -569,6 +612,9 @@ static void sbw_navigation_starts (int a_id, int a_frame, ICoreWebView2Navigatio
         *l_pass_valid = 1;
     } else if (*l_pass_valid && l_navigation == *l_pass_navigation) {
         /* A redirect of a navigation already let through. */
+    } else if (l_frame && !(l_frame->hint_url && l_uri && wcscmp (l_frame->hint_url, l_uri) == 0)) {
+        /* An iframe navigation the frame did not start itself: its parent page set its src or
+           srcdoc. The parent's doing, as the iframe's first load is: not asked. */
     } else if (l_engine->deciding) {
         l_number = sbw_hold (a_id, a_frame, l_uri);
         if (l_number > 0) {
@@ -578,6 +624,10 @@ static void sbw_navigation_starts (int a_id, int a_frame, ICoreWebView2Navigatio
             free (l_text);
         }
         /* No room to hold it: allowed, as with no handler. */
+    }
+    if (l_frame) {
+        free (l_frame->hint_url);
+        l_frame->hint_url = NULL;
     }
     if (l_uri) { CoTaskMemFree (l_uri); }
 }
@@ -617,6 +667,8 @@ static void sbw_release_frame (int a_slot) {
     if (a_slot >= 0 && a_slot < SBW_MAX_FRAMES && sbw_frames[a_slot].in_use) {
         sbw_frames[a_slot].in_use = 0;
         if (sbw_frames[a_slot].frame) { ICoreWebView2Frame2_Release (sbw_frames[a_slot].frame); }
+        free (sbw_frames[a_slot].hint_url);
+        sbw_frames[a_slot].hint_url = NULL;
         sbw_frames[a_slot].frame = NULL;
     }
 }
