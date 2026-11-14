@@ -105,6 +105,8 @@ typedef struct {
     sbg_hint_t hints[SBG_MAX_HINTS];  /* the frame script's hints, newest kept */
     int min_w, min_h, max_w, max_h, fixed;  /* size hints, logical pixels; 0 = none */
     int width, height;        /* the content size last asked for */
+    int decor_w, decor_h;     /* the window's size beyond its content (client-side decorations) */
+    GdkSurface *surface;      /* the own window's surface, whose layout signal we follow */
     sbg_script_t scripts[SBG_MAX_SCRIPTS];
     sbg_event_t *current;     /* the event last taken */
 } sbg_engine_t;
@@ -1046,7 +1048,32 @@ static void sbg_apply_size (sbg_engine_t *a_engine, int a_width, int a_height) {
     if (a_engine->max_h > 0 && a_height > a_engine->max_h) { a_height = a_engine->max_h; }
     a_engine->width = a_width;
     a_engine->height = a_height;
-    gtk_window_set_default_size (GTK_WINDOW (a_engine->window), a_width, a_height);
+        /* GTK 4's default size is the window's, client-side decorations (Wayland's titlebar)
+           included: the content's size plus the decorations measured so far. */
+    gtk_window_set_default_size (GTK_WINDOW (a_engine->window), a_width + a_engine->decor_w, a_height + a_engine->decor_h);
+}
+
+/* The surface was laid out: measure the decorations (the window's allocation beyond its
+   content's) and, when they differ from the ones the size was asked with, ask again, so the
+   content gets the size asked for. A size the user gives the window leaves them unchanged,
+   so it is never undone. */
+static void sbg_on_layout (GdkSurface *a_surface, int a_width, int a_height, gpointer a_data) {
+    sbg_engine_t *l_engine = sbg_live (a_data);
+    int l_content_w, l_content_h, l_decor_w, l_decor_h;
+    if (!l_engine || !l_engine->owns_window || !l_engine->window || !l_engine->content) { return; }
+    l_content_w = gtk_widget_get_width (l_engine->content);
+    l_content_h = gtk_widget_get_height (l_engine->content);
+    if (l_content_w <= 0 || l_content_h <= 0) { return; }
+    l_decor_w = MAX (gtk_widget_get_width (l_engine->window) - l_content_w, 0);
+    l_decor_h = MAX (gtk_widget_get_height (l_engine->window) - l_content_h, 0);
+    if (l_decor_w != l_engine->decor_w || l_decor_h != l_engine->decor_h) {
+        sbg_log ("decorations engine=%d %dx%d (window %dx%d, content %dx%d)", GPOINTER_TO_INT (a_data),
+                 l_decor_w, l_decor_h, gtk_widget_get_width (l_engine->window), gtk_widget_get_height (l_engine->window),
+                 l_content_w, l_content_h);
+        l_engine->decor_w = l_decor_w;
+        l_engine->decor_h = l_decor_h;
+        gtk_window_set_default_size (GTK_WINDOW (l_engine->window), l_engine->width + l_decor_w, l_engine->height + l_decor_h);
+    }
 }
 
 /* The size the content has, if laid out, else the size last asked for. */
@@ -1128,6 +1155,11 @@ static void sbg_show (int a_id) {
     sbg_engine_t *l_engine = sbg_engine (a_id);
     if (!l_engine || !l_engine->owns_window || !l_engine->window || gtk_widget_get_visible (l_engine->window)) { return; }
     gtk_widget_realize (l_engine->window);
+    l_engine->surface = gtk_native_get_surface (GTK_NATIVE (l_engine->window));
+    if (l_engine->surface) {
+        g_object_ref (l_engine->surface);
+        g_signal_connect_after (l_engine->surface, "layout", G_CALLBACK (sbg_on_layout), GINT_TO_POINTER (a_id));
+    }
 #ifdef GDK_WINDOWING_X11
     {
         GdkSurface *l_surface = gtk_native_get_surface (GTK_NATIVE (l_engine->window));
@@ -1358,6 +1390,10 @@ static void sbg_dispose (int a_id) {
         webkit_user_content_manager_unregister_script_message_handler (l_engine->content_manager, "sb_gtk_frame", NULL);
     }
     if (l_engine->owns_window) {
+        if (l_engine->surface) {
+            g_signal_handlers_disconnect_by_data (l_engine->surface, l_data);
+            g_object_unref (l_engine->surface);
+        }
         if (l_engine->window) {
             g_signal_handlers_disconnect_by_data (l_engine->window, l_data);
             gtk_window_destroy (GTK_WINDOW (l_engine->window));
