@@ -59,5 +59,6 @@ int sb_test_window_count(int e);   /* this engine's window and any no engine mad
 int sb_test_content_width(int e);
 int sb_test_content_height(int e);
 int sb_test_is_resizable(int e);
+void sb_test_echo_at(int e, const char *a_url);   /* requests for it get a page showing method and body */
 
 #endif

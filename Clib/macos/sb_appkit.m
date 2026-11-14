@@ -112,7 +112,11 @@ int sb_is_gui_thread(void) { return pthread_main_np() ? 1 : 0; }
 	NSMutableDictionary<NSNumber *, void (^)(WKNavigationActionPolicy)> *held;
 	BOOL load_failed;
 	BOOL fixed;                /* a fixed size: a plain set_size holds to it until a min or max hint */
+	NSString *echo_url;        /* tests: requests for it get a page showing their method and body */
+	NSMutableDictionary<NSNumber *, NSURLRequest *> *held_request;   /* each held decision's request */
 }
+- (BOOL)echoes:(NSURLRequest *)a_request;
+- (void)echo:(NSURLRequest *)a_request;
 - (void)rebuildScripts;
 @end
 
@@ -145,12 +149,16 @@ static SBEngine *sb_engine(int e) { return e >= 1 && e <= SB_MAX_ENGINES ? s_eng
 {
 	WKUserContentController *u = [[view configuration] userContentController];
 	[u removeAllUserScripts];
-	NSMutableArray<NSString *> *l_all = [NSMutableArray array];
-	if ([bridge length]) [l_all addObject:bridge];
-	[l_all addObjectsFromArray:scripts];
-	for (NSString *n in bound) [l_all addObject:binding_script[n]];
-	for (NSString *s in l_all)
+	/* the bridge and the bindings in the main frame only; the program's own scripts (`inject') in
+	   every frame, on every platform */
+	if ([bridge length])
+		[u addUserScript:[[WKUserScript alloc] initWithSource:bridge injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+			forMainFrameOnly:YES inContentWorld:[WKContentWorld pageWorld]]];
+	for (NSString *s in scripts)
 		[u addUserScript:[[WKUserScript alloc] initWithSource:s injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+			forMainFrameOnly:NO inContentWorld:[WKContentWorld pageWorld]]];
+	for (NSString *n in bound)
+		[u addUserScript:[[WKUserScript alloc] initWithSource:binding_script[n] injectionTime:WKUserScriptInjectionTimeAtDocumentStart
 			forMainFrameOnly:YES inContentWorld:[WKContentWorld pageWorld]]];
 }
 
@@ -168,7 +176,14 @@ static SBEngine *sb_engine(int e) { return e >= 1 && e <= SB_MAX_ENGINES ? s_eng
 	}
 	BOOL l_main = [[an_action targetFrame] isMainFrame];
 	if (pass_next && l_main) { pass_next = NO; a_handler(WKNavigationActionPolicyAllow); return; }
-	if (!deciding) { a_handler(WKNavigationActionPolicyAllow); return; }
+	/* an iframe's first load (its own src or srcdoc) is part of the page's load, as the main
+	   frame's own is: not asked; later navigations inside it are */
+	if (!l_main && [an_action navigationType] == WKNavigationTypeOther && [[an_action sourceFrame] isMainFrame]) { a_handler(WKNavigationActionPolicyAllow); return; }
+	if (!deciding) {
+		if ([self echoes:[an_action request]]) { a_handler(WKNavigationActionPolicyCancel); [self echo:[an_action request]]; return; }
+		a_handler(WKNavigationActionPolicyAllow);
+		return;
+	}
 	int l_kind = 0;
 	switch ([an_action navigationType]) {
 		case WKNavigationTypeLinkActivated: l_kind = 1; break;
@@ -179,6 +194,7 @@ static SBEngine *sb_engine(int e) { return e >= 1 && e <= SB_MAX_ENGINES ? s_eng
 	}
 	int d = ++next_decision;
 	held[@(d)] = [a_handler copy];
+	held_request[@(d)] = [an_action request];
 	sb_push(SB_EVENT_NAVIGATING, eid, d, l_kind, l_main ? 1 : 0, l_url, nil, nil);
 }
 - (void)webView:(WKWebView *)w didStartProvisionalNavigation:(WKNavigation *)n { (void)w; (void)n; load_failed = NO; }
@@ -207,6 +223,23 @@ static SBEngine *sb_engine(int e) { return e >= 1 && e <= SB_MAX_ENGINES ? s_eng
 	return nil;
 }
 
+/* ---- tests: the echo page (`test_echo_at') */
+- (BOOL)echoes:(NSURLRequest *)a_request
+{
+	return [echo_url length] && [[[a_request URL] absoluteString] isEqualToString:echo_url];
+}
+/* The request's method, a line break, then its body, in element `echo' of a page at its URL (the
+   request itself is refused: the reserved name never reaches the network). */
+- (void)echo:(NSURLRequest *)a_request
+{
+	NSString *l_body = [a_request HTTPBody] ? [[NSString alloc] initWithData:[a_request HTTPBody] encoding:NSUTF8StringEncoding] : @"";
+	NSString *l_text = [NSString stringWithFormat:@"%@\n%@", [a_request HTTPMethod] ?: @"GET", l_body ?: @""];
+	l_text = [[[l_text stringByReplacingOccurrencesOfString:@"&" withString:@"&amp;"]
+		stringByReplacingOccurrencesOfString:@"<" withString:@"&lt;"] stringByReplacingOccurrencesOfString:@">" withString:@"&gt;"];
+	pass_next = YES;
+	[view loadHTMLString:[NSString stringWithFormat:@"<!DOCTYPE html><html><body><pre id=\"echo\">%@</pre></body></html>", l_text] baseURL:[a_request URL]];
+}
+
 /* ---- the title, by notification (section 4.7) */
 - (void)observeValueForKeyPath:(NSString *)p ofObject:(id)o change:(NSDictionary *)ch context:(void *)ctx
 {
@@ -231,6 +264,7 @@ int sb_create(void *a_parent, int a_ephemeral, int a_debug)
 	e->bound = [NSMutableArray array];
 	e->binding_script = [NSMutableDictionary dictionary];
 	e->held = [NSMutableDictionary dictionary];
+	e->held_request = [NSMutableDictionary dictionary];
 	WKWebViewConfiguration *k = [[WKWebViewConfiguration alloc] init];
 	/* window.open from a script reaches the navigation delegate, to be reported and refused
 	   (section 4.5); without this WebKit drops it silently unless a click started it */
@@ -275,6 +309,7 @@ void sb_destroy(int an_id)
 	/* WebKit requires every held decision to be answered */
 	for (NSNumber *k in [e->held allKeys]) e->held[k](WKNavigationActionPolicyCancel);
 	[e->held removeAllObjects];
+	[e->held_request removeAllObjects];
 	[e->view removeObserver:e forKeyPath:@"title"];
 	[e->view stopLoading];
 	[e->view setNavigationDelegate:nil];
@@ -438,6 +473,8 @@ void sb_evaluate(int an_id, int a_ticket, const char *a_body)
 
 /* ---------------------------------------------------------------- navigation decisions */
 
+void sb_test_echo_at(int an_id, const char *a_url) { SBEngine *e = sb_engine(an_id); if (e) e->echo_url = sb_string(a_url); }
+
 void sb_set_deciding(int an_id, int a_on) { SBEngine *e = sb_engine(an_id); if (e) e->deciding = a_on != 0; }
 
 void sb_decide(int an_id, int a_decision, int a_allow)
@@ -445,7 +482,10 @@ void sb_decide(int an_id, int a_decision, int a_allow)
 	SBEngine *e = sb_engine(an_id);
 	void (^h)(WKNavigationActionPolicy) = e ? e->held[@(a_decision)] : nil;
 	if (!h) return;
+	NSURLRequest *r = e->held_request[@(a_decision)];
 	[e->held removeObjectForKey:@(a_decision)];
+	[e->held_request removeObjectForKey:@(a_decision)];
+	if (a_allow && r && [e echoes:r]) { h(WKNavigationActionPolicyCancel); [e echo:r]; return; }
 	h(a_allow ? WKNavigationActionPolicyAllow : WKNavigationActionPolicyCancel);
 }
 

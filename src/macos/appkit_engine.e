@@ -77,11 +77,9 @@ feature -- Navigation
 		end
 
 	set_html (a_html: READABLE_STRING_GENERAL)
-			-- <Precursor>: at https://simple-browser.invalid/page-N, a reserved name that never
-			-- reaches the network, so every platform's pages have one https origin.
+			-- <Precursor>
 		do
-			page_serial := page_serial + 1
-			c_set_html (engine_id, utf_8 (a_html).item, utf_8 ("https://simple-browser.invalid/page-" + page_serial.out).item)
+			c_set_html (engine_id, utf_8 (a_html).item, utf_8 (new_set_html_base).item)
 		end
 
 	set_html_with_base (a_html, a_base_url: READABLE_STRING_GENERAL)
@@ -213,6 +211,12 @@ feature -- Tests
 			Result := c_window_count (engine_id)
 		end
 
+	test_echo_at (a_url: READABLE_STRING_GENERAL)
+			-- <Precursor>: the request itself is refused, and a page at its URL shows what it carried.
+		do
+			c_echo_at (engine_id, utf_8 (a_url).item)
+		end
+
 	test_content_width: INTEGER
 		do
 			Result := c_content_width (engine_id)
@@ -232,9 +236,6 @@ feature {NONE} -- Implementation
 
 	engine_id: INTEGER
 			-- The C side's engine; 0 none.
-
-	page_serial: INTEGER
-			-- How many pages `set_html' has loaded.
 
 	utf_8 (a_text: READABLE_STRING_GENERAL): C_STRING
 			-- `a_text' as NUL-terminated UTF-8.
@@ -320,6 +321,9 @@ feature {NONE} -- C
 
 	c_window_count (e: INTEGER): INTEGER
 		external "C inline use %"sb_appkit.h%"" alias "return sb_test_window_count($e);" end
+
+	c_echo_at (e: INTEGER; a_url: POINTER)
+		external "C inline use %"sb_appkit.h%"" alias "sb_test_echo_at($e, (const char *) $a_url);" end
 
 	c_content_width (e: INTEGER): INTEGER
 		external "C inline use %"sb_appkit.h%"" alias "return sb_test_content_width($e);" end
