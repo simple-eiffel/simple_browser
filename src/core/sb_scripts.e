@@ -66,6 +66,22 @@ return s === undefined ? "null" : s;
 	Script_placeholder: STRING_8 = "@SCRIPT@"
 			-- Where `Evaluate_wrapper' takes the script.
 
+	Set_html_origin: STRING_8 = "https://simple-browser.invalid"
+			-- The origin of every page `set_html' loads, on every platform. The name is reserved
+			-- (RFC 2606), so it never reaches the network: each engine answers it itself.
+
+feature -- Pages
+
+	set_html_base (a_page: INTEGER): STRING_8
+			-- The URL of `set_html''s page number `a_page': `Set_html_origin' + "/page-N".
+		require
+			page_positive: a_page > 0
+		do
+			Result := Set_html_origin + "/page-" + a_page.out
+		ensure
+			at_the_origin: Result.starts_with (Set_html_origin + "/")
+		end
+
 feature -- Script texts
 
 	binding_line (a_name: READABLE_STRING_8): STRING_8

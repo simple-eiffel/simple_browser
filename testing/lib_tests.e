@@ -171,7 +171,7 @@ feature -- Tests (shared, SIMPLE_BROWSER_SPEC.md section 5)
 	test_a_navigation_is_held_and_answered
 			-- The handler cancels about:blank#blocked and allows about:blank#allowed; the page
 			-- clicks a link to each; `location.hash' is then "#allowed"; both were links in the
-			-- main frame.
+			-- main frame. A link inside an iframe is asked too, not in the main frame.
 		local
 			l_browser: SIMPLE_BROWSER
 		do
@@ -182,22 +182,68 @@ feature -- Tests (shared, SIMPLE_BROWSER_SPEC.md section 5)
 				<html><body>
 				<a id="blocked" href="about:blank#blocked">blocked</a>
 				<a id="allowed" href="about:blank#allowed">allowed</a>
+				<iframe id="frame" srcdoc="<a id=&quot;inner&quot; href=&quot;about:blank#inner&quot;>inner</a>"></iframe>
 				<script>
 				setTimeout (() => {
-				  document.getElementById ("blocked").click ();
-				  setTimeout (() => document.getElementById ("allowed").click (), 500);
-				}, 200);
+				  document.getElementById ("frame").contentDocument.getElementById ("inner").click ();
+				  setTimeout (() => document.getElementById ("blocked").click (), 500);
+				  setTimeout (() => document.getElementById ("allowed").click (), 1000);
+				}, 300);
 				</script>
 				</body></html>
 			]")
 			l_browser.run
 			l_browser.dispose
 			refute ("no timeout", timed_out)
-			assert ("asked about #blocked", navigations.has ({STRING_32} "about:blank#blocked"))
-			assert ("asked about #allowed", navigations.has ({STRING_32} "about:blank#allowed"))
-			assert ("every navigation asked was a link", navigation_kinds_all_links)
-			assert ("every navigation asked was in the main frame", navigation_frames_all_main)
+			assert_equal ("#blocked: a link in the main frame", "1 main", asked.item ("about:blank#blocked"))
+			assert_equal ("#allowed: a link in the main frame", "1 main", asked.item ("about:blank#allowed"))
+			if attached asked.item ("about:blank#inner") as al_inner then
+				assert_string_ends_with ("#inner: not in the main frame", al_inner, " iframe")
+			else
+				assert ("asked about the iframe's #inner", False)
+			end
 			assert_equal ("location.hash", "ok %"#allowed%"", results.item ("hash"))
+		end
+
+	test_a_form_is_held_and_submitted
+			-- A form with method POST, held then allowed, reaches the page it posts to with its
+			-- fields: the replay is the real request, not a GET of its URL.
+		local
+			l_browser: SIMPLE_BROWSER
+		do
+			l_browser := new_browser
+			l_browser.engine.test_echo_at (Echo_url)
+			l_browser.on_navigation (agent on_form_navigation)
+			l_browser.on_loaded (agent on_form_loaded (l_browser, ?, ?))
+			l_browser.set_html_content ("[
+				<html><body>
+				<form id="form" method="post" action="https://simple-browser.invalid/echo">
+				<input name="a" value="1"><input name="b" value="two words">
+				<button id="send" type="submit">send</button>
+				</form>
+				<script>setTimeout (() => document.getElementById ("send").click (), 300);</script>
+				</body></html>
+			]")
+			l_browser.run
+			l_browser.dispose
+			refute ("no timeout", timed_out)
+			assert_equal ("the form was asked about, as a form in the main frame", "2 main", asked.item (Echo_url))
+			assert_equal ("the page got POST and the fields", "ok %"POST\na=1&b=two+words%"", results.item ("echo"))
+		end
+
+	test_a_set_html_page_has_the_shared_origin
+			-- Every `set_html' page loads at https://simple-browser.invalid/page-N, on every
+			-- platform (SB_SCRIPTS.set_html_base).
+		local
+			l_browser: SIMPLE_BROWSER
+		do
+			l_browser := new_browser
+			l_browser.on_loaded (agent on_store_loaded (l_browser, "location.origin", "origin", ?, ?))
+			l_browser.set_html_content ("<html><body>origin</body></html>")
+			l_browser.run
+			l_browser.dispose
+			refute ("no timeout", timed_out)
+			assert_equal ("location.origin", "ok %"https://simple-browser.invalid%"", results.item ("origin"))
 		end
 
 	test_a_new_window_is_reported_not_opened
@@ -385,8 +431,7 @@ feature {NONE} -- Shared test support
 			create results.make (8)
 			create echoes.make (8)
 			create navigations.make (4)
-			create navigation_kinds.make (4)
-			create navigation_frames.make (4)
+			create asked.make (4)
 			create new_windows.make (4)
 			create sizes.make (8)
 			titles.compare_objects
@@ -408,6 +453,9 @@ feature {NONE} -- Shared test support
 	Store_origin: STRING_8 = "https://simple-browser.test/"
 			-- The origin both engines of `test_the_ephemeral_store_forgets' load.
 
+	Echo_url: STRING_32 = "https://simple-browser.invalid/echo"
+			-- Where `test_a_form_is_held_and_submitted' posts (answered by `test_echo_at').
+
 	timed_out: BOOLEAN
 	loads_ok, loads_failed: INTEGER
 	titles: ARRAYED_LIST [STRING_32] attribute create Result.make (0) end
@@ -415,8 +463,7 @@ feature {NONE} -- Shared test support
 	echoes: ARRAYED_LIST [STRING_8] attribute create Result.make (0) end
 	reported: detachable STRING_8
 	navigations: ARRAYED_LIST [STRING_32] attribute create Result.make (0) end
-	navigation_kinds: ARRAYED_LIST [INTEGER] attribute create Result.make (0) end
-	navigation_frames: ARRAYED_LIST [BOOLEAN] attribute create Result.make (0) end
+	asked: HASH_TABLE [STRING_8, STRING_32] attribute create Result.make (0) end
 	new_windows: ARRAYED_LIST [STRING_32] attribute create Result.make (0) end
 	window_count: INTEGER
 	sizes: ARRAYED_LIST [STRING_8] attribute create Result.make (0) end
@@ -459,15 +506,6 @@ feature {NONE} -- Shared test support
 			end
 		end
 
-	navigation_kinds_all_links: BOOLEAN
-		do
-			Result := not navigation_kinds.is_empty and across navigation_kinds as ic all ic = {SB_NAVIGATION}.Kind_link end
-		end
-
-	navigation_frames_all_main: BOOLEAN
-		do
-			Result := not navigation_frames.is_empty and across navigation_frames as ic all ic end
-		end
 
 feature {NONE} -- Title test
 
@@ -549,9 +587,7 @@ feature {NONE} -- Navigation tests
 
 	on_hold_navigation (a_browser: SIMPLE_BROWSER; a_navigation: SB_NAVIGATION): BOOLEAN
 		do
-			navigations.extend (a_navigation.url)
-			navigation_kinds.extend (a_navigation.kind)
-			navigation_frames.extend (a_navigation.is_main_frame)
+			record_asked (a_navigation)
 			Result := not a_navigation.url.same_string ("about:blank#blocked")
 			if a_navigation.url.same_string ("about:blank#allowed") then
 				allowed_seen := True
@@ -596,6 +632,29 @@ feature {NONE} -- Navigation tests
 			else
 				record_result ("hash", a_ok, a_json)
 				a_browser.close
+			end
+		end
+
+	record_asked (a_navigation: SB_NAVIGATION)
+			-- Keep "<kind> main" or "<kind> iframe" under the navigation's url.
+		do
+			navigations.extend (a_navigation.url)
+			asked.force (a_navigation.kind.out + (if a_navigation.is_main_frame then " main" else " iframe" end),
+				a_navigation.url)
+		end
+
+	on_form_navigation (a_navigation: SB_NAVIGATION): BOOLEAN
+		do
+			record_asked (a_navigation)
+			Result := True
+		end
+
+	on_form_loaded (a_browser: SIMPLE_BROWSER; a_ok: BOOLEAN; a_error: STRING_32)
+		do
+			loads_ok := loads_ok + 1
+			if loads_ok = 2 then
+				a_browser.evaluate ("document.getElementById ('echo').textContent",
+					agent on_result_then (a_browser, "echo", Void, ?, ?))
 			end
 		end
 

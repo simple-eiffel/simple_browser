@@ -48,6 +48,8 @@ feature {NONE} -- Test Runners
 			run_test (agent lib_tests.test_close_ends_run, "test_close_ends_run")
 			run_test (agent lib_tests.test_htmx_and_alpine_load_without_the_network, "test_htmx_and_alpine_load_without_the_network")
 			run_test (agent lib_tests.test_size_hints_hold, "test_size_hints_hold")
+			run_test (agent lib_tests.test_a_form_is_held_and_submitted, "test_a_form_is_held_and_submitted")
+			run_test (agent lib_tests.test_a_set_html_page_has_the_shared_origin, "test_a_set_html_page_has_the_shared_origin")
 				-- Beyond the spec's list
 			run_test (agent lib_tests.test_a_browser_inside_a_window, "test_a_browser_inside_a_window")
 		end

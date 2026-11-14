@@ -49,6 +49,7 @@
 #define SBW_MAX_HELD 64
 #define SBW_MAX_SCRIPTS 64
 #define SBW_NAME_MAX 128
+#define SBW_MAX_FRAMES 64
 
 #define SBW_EVENT_CALL 1
 #define SBW_EVENT_EVALUATED 2
@@ -96,8 +97,8 @@ typedef struct {
     int pass_valid;
     int min_w, min_h, max_w, max_h, fixed;  /* size hints, logical pixels; 0 = none */
     wchar_t *served_url;      /* set_html, set_html_with_base: the URL answered with served_html */
-    int page_serial;          /* set_html's pages, numbered */
     char *served_html;
+    wchar_t *echo_url;        /* test hook: the URL answered with the request's method and body */
     int ephemeral;
     wchar_t data_folder[MAX_PATH];
     sbw_script_t scripts[SBW_MAX_SCRIPTS];
@@ -108,11 +109,24 @@ typedef struct {
     int in_use;
     int engine;
     int number;
+    int frame;                /* 0 the main frame, else 1 + the iframe's slot in sbw_frames */
     wchar_t *url;             /* the navigation, canceled at once; replayed if Eiffel allows it */
 } sbw_held_t;
 
+/* An iframe of an engine's page (ICoreWebView2_4 FrameCreated), with its own navigations. */
+typedef struct {
+    int in_use;
+    int engine;
+    ICoreWebView2Frame2 *frame;  /* referenced by us */
+    int started;              /* its first navigation (the iframe's own src) is let through */
+    int pass_pending;         /* replays still to let through */
+    UINT64 pass_navigation;
+    int pass_valid;
+} sbw_frame_t;
+
 SBW_SHARED sbw_engine_t sbw_engines[SBW_MAX_ENGINES] = {0};
 SBW_SHARED sbw_held_t sbw_held[SBW_MAX_HELD] = {0};
+SBW_SHARED sbw_frame_t sbw_frames[SBW_MAX_FRAMES] = {0};
 SBW_SHARED sbw_event_t *sbw_queue_head = NULL;
 SBW_SHARED sbw_event_t *sbw_queue_tail = NULL;
 SBW_SHARED SRWLOCK sbw_lock = SRWLOCK_INIT;
@@ -397,13 +411,66 @@ static ICoreWebView2WebMessageReceivedEventHandlerVtbl sbw_message_vtbl = {
     sbw_on_message
 };
 
+/* An iframe's web message: queued with c = 1 + the frame's slot. */
+SBW_HANDLER_UNKNOWN (ICoreWebView2FrameWebMessageReceivedEventHandler)
+
+static HRESULT STDMETHODCALLTYPE sbw_on_frame_message (ICoreWebView2FrameWebMessageReceivedEventHandler *a_this,
+        ICoreWebView2Frame *a_sender, ICoreWebView2WebMessageReceivedEventArgs *a_args) {
+    sbw_handler_t *l_self = (sbw_handler_t *) a_this;
+    LPWSTR l_json = NULL;
+    if (SUCCEEDED (ICoreWebView2WebMessageReceivedEventArgs_get_WebMessageAsJson (a_args, &l_json)) && l_json) {
+        sbw_push_wide (l_self->engine, SBW_EVENT_MESSAGE, 0, 0, l_self->extra + 1, l_json);
+        CoTaskMemFree (l_json);
+    }
+    return S_OK;
+}
+
+static ICoreWebView2FrameWebMessageReceivedEventHandlerVtbl sbw_frame_message_vtbl = {
+    ICoreWebView2FrameWebMessageReceivedEventHandler_sbw_query,
+    ICoreWebView2FrameWebMessageReceivedEventHandler_sbw_add_ref,
+    ICoreWebView2FrameWebMessageReceivedEventHandler_sbw_release,
+    sbw_on_frame_message
+};
+
+/* The iframe `a_frame' (1 + slot) of engine `a_id', if it is alive. */
+static sbw_frame_t *sbw_frame (int a_id, int a_frame) {
+    if (a_frame >= 1 && a_frame <= SBW_MAX_FRAMES && sbw_frames[a_frame - 1].in_use
+            && sbw_frames[a_frame - 1].engine == a_id) {
+        return &sbw_frames[a_frame - 1];
+    }
+    return NULL;
+}
+
+/* `a_text' as a JavaScript string literal, double-quoted (UTF-16). */
+static wchar_t *sbw_js_string (LPCWSTR a_text) {
+    size_t l_n = wcslen (a_text ? a_text : L"");
+    wchar_t *l_result = (wchar_t *) malloc (sizeof (wchar_t) * (l_n * 6 + 3));
+    size_t i, j = 0;
+    if (!l_result) { return NULL; }
+    l_result[j++] = L'"';
+    for (i = 0; i < l_n; i++) {
+        wchar_t l_c = a_text[i];
+        if (l_c == L'"' || l_c == L'\\') {
+            l_result[j++] = L'\\';
+            l_result[j++] = l_c;
+        } else if (l_c < 32 || l_c == 0x2028 || l_c == 0x2029) {
+            j += (size_t) swprintf (l_result + j, 7, L"\\u%04x", (unsigned int) l_c);
+        } else {
+            l_result[j++] = l_c;
+        }
+    }
+    l_result[j++] = L'"';
+    l_result[j] = 0;
+    return l_result;
+}
+
 /* --- NavigationStarting: decisions ------------------------------------------------------
    WebView2's NavigationStarting takes no deferral: the handler must say Cancel or not before it
    returns, and C never calls Eiffel. So a navigation the page starts is canceled at once and
    queued as `navigating'; if the Eiffel handler allows it, `sbw_decide' replays it with
    ICoreWebView2::Navigate, which the engine lets through as its own load. */
 
-static int sbw_hold (int a_engine, LPCWSTR a_url) {
+static int sbw_hold (int a_engine, int a_frame, LPCWSTR a_url) {
     int i;
     size_t l_n;
     for (i = 0; i < SBW_MAX_HELD; i++) {
@@ -416,6 +483,7 @@ static int sbw_hold (int a_engine, LPCWSTR a_url) {
             memcpy (sbw_held[i].url, a_url ? a_url : L"", sizeof (wchar_t) * l_n);
             sbw_held[i].in_use = 1;
             sbw_held[i].engine = a_engine;
+            sbw_held[i].frame = a_frame;
             sbw_held[i].number = sbw_next_decision;
             return sbw_next_decision;
         }
@@ -423,17 +491,38 @@ static int sbw_hold (int a_engine, LPCWSTR a_url) {
     return 0;
 }
 
-/* Answer held decision `a_number' of engine `a_engine': replay the navigation if allowed. */
+/* Answer held decision `a_number' of engine `a_engine': replay the navigation if allowed, in
+   the main frame with ICoreWebView2::Navigate, in an iframe with location.assign there. */
 static void sbw_answer_held (int a_engine, int a_number, int a_allow) {
     sbw_engine_t *l_engine = sbw_engine (a_engine);
+    sbw_frame_t *l_frame;
+    wchar_t *l_literal;
+    wchar_t *l_script;
+    size_t l_n;
     int i;
     for (i = 0; i < SBW_MAX_HELD; i++) {
         if (sbw_held[i].in_use && sbw_held[i].engine == a_engine && sbw_held[i].number == a_number) {
             sbw_held[i].in_use = 0;
-            sbw_log ("decide engine=%d number=%d allow=%d url=%.200S", a_engine, a_number, a_allow, sbw_held[i].url);
+            sbw_log ("decide engine=%d number=%d frame=%d allow=%d url=%.200S", a_engine, a_number,
+                     sbw_held[i].frame, a_allow, sbw_held[i].url);
             if (a_allow && l_engine && !l_engine->disposing && l_engine->view) {
-                l_engine->pass_pending = l_engine->pass_pending + 1;
-                ICoreWebView2_Navigate (l_engine->view, sbw_held[i].url);
+                if (sbw_held[i].frame == 0) {
+                    l_engine->pass_pending = l_engine->pass_pending + 1;
+                    ICoreWebView2_Navigate (l_engine->view, sbw_held[i].url);
+                } else if ((l_frame = sbw_frame (a_engine, sbw_held[i].frame)) != NULL) {
+                    l_literal = sbw_js_string (sbw_held[i].url);
+                    if (l_literal) {
+                        l_n = wcslen (l_literal) + 32;
+                        l_script = (wchar_t *) malloc (sizeof (wchar_t) * l_n);
+                        if (l_script) {
+                            swprintf (l_script, l_n, L"location.assign (%ls);", l_literal);
+                            l_frame->pass_pending = l_frame->pass_pending + 1;
+                            ICoreWebView2Frame2_ExecuteScript (l_frame->frame, l_script, NULL);
+                            free (l_script);
+                        }
+                        free (l_literal);
+                    }
+                }
             }
             free (sbw_held[i].url);
             sbw_held[i].url = NULL;
@@ -444,41 +533,58 @@ static void sbw_answer_held (int a_engine, int a_number, int a_allow) {
 
 SBW_HANDLER_UNKNOWN (ICoreWebView2NavigationStartingEventHandler)
 
-static HRESULT STDMETHODCALLTYPE sbw_on_navigation_starting (ICoreWebView2NavigationStartingEventHandler *a_this,
-        ICoreWebView2 *a_sender, ICoreWebView2NavigationStartingEventArgs *a_args) {
-    sbw_handler_t *l_self = (sbw_handler_t *) a_this;
-    sbw_engine_t *l_engine = sbw_engine (l_self->engine);
+/* The decision rule for a navigation of engine `a_id' in frame `a_frame' (0 the main frame). */
+static void sbw_navigation_starts (int a_id, int a_frame, ICoreWebView2NavigationStartingEventArgs *a_args) {
+    sbw_engine_t *l_engine = sbw_engine (a_id);
+    sbw_frame_t *l_frame = a_frame ? sbw_frame (a_id, a_frame) : NULL;
     UINT64 l_navigation = 0;
     BOOL l_user = FALSE, l_redirected = FALSE;
     LPWSTR l_uri = NULL;
     int l_number;
     char *l_text;
-    if (!l_engine || l_engine->disposing) { return S_OK; }
+    int *l_pass_pending;
+    UINT64 *l_pass_navigation;
+    int *l_pass_valid;
+    if (!l_engine || l_engine->disposing || (a_frame && !l_frame)) { return; }
+    l_pass_pending = l_frame ? &l_frame->pass_pending : &l_engine->pass_pending;
+    l_pass_navigation = l_frame ? &l_frame->pass_navigation : &l_engine->pass_navigation;
+    l_pass_valid = l_frame ? &l_frame->pass_valid : &l_engine->pass_valid;
     ICoreWebView2NavigationStartingEventArgs_get_NavigationId (a_args, &l_navigation);
     ICoreWebView2NavigationStartingEventArgs_get_IsUserInitiated (a_args, &l_user);
     ICoreWebView2NavigationStartingEventArgs_get_IsRedirected (a_args, &l_redirected);
     ICoreWebView2NavigationStartingEventArgs_get_Uri (a_args, &l_uri);
-    sbw_log ("navigation starting engine=%d id=%llu user=%d redirected=%d pass=%d deciding=%d uri=%.200S",
-             l_self->engine, (unsigned long long) l_navigation, (int) l_user,
-             (int) l_redirected, l_engine->pass_pending, l_engine->deciding, l_uri ? l_uri : L"");
-    if (l_engine->pass_pending > 0) {
+    sbw_log ("navigation starting engine=%d frame=%d id=%llu user=%d redirected=%d pass=%d deciding=%d uri=%.200S",
+             a_id, a_frame, (unsigned long long) l_navigation, (int) l_user,
+             (int) l_redirected, *l_pass_pending, l_engine->deciding, l_uri ? l_uri : L"");
+    if (l_frame && !l_frame->started) {
+        /* An iframe's first navigation loads its own src (or srcdoc): part of the page's load,
+           like the main frame's own load, and nothing a replay could reproduce. */
+        l_frame->started = 1;
+        *l_pass_navigation = l_navigation;
+        *l_pass_valid = 1;
+    } else if (*l_pass_pending > 0) {
         /* The program's own navigate or set_html, or a replay: never asked (spec 4.4). */
-        l_engine->pass_pending = l_engine->pass_pending - 1;
-        l_engine->pass_navigation = l_navigation;
-        l_engine->pass_valid = 1;
-    } else if (l_engine->pass_valid && l_navigation == l_engine->pass_navigation) {
+        *l_pass_pending = *l_pass_pending - 1;
+        *l_pass_navigation = l_navigation;
+        *l_pass_valid = 1;
+    } else if (*l_pass_valid && l_navigation == *l_pass_navigation) {
         /* A redirect of a navigation already let through. */
     } else if (l_engine->deciding) {
-        l_number = sbw_hold (l_self->engine, l_uri);
+        l_number = sbw_hold (a_id, a_frame, l_uri);
         if (l_number > 0) {
             ICoreWebView2NavigationStartingEventArgs_put_Cancel (a_args, TRUE);
             l_text = sbw_utf8 (l_uri);
-            sbw_push (l_self->engine, SBW_EVENT_NAVIGATING, l_number, 0, 1, l_text, NULL, NULL);
+            sbw_push (a_id, SBW_EVENT_NAVIGATING, l_number, 0, a_frame == 0, l_text, NULL, NULL);
             free (l_text);
         }
         /* No room to hold it: allowed, as with no handler. */
     }
     if (l_uri) { CoTaskMemFree (l_uri); }
+}
+
+static HRESULT STDMETHODCALLTYPE sbw_on_navigation_starting (ICoreWebView2NavigationStartingEventHandler *a_this,
+        ICoreWebView2 *a_sender, ICoreWebView2NavigationStartingEventArgs *a_args) {
+    sbw_navigation_starts (((sbw_handler_t *) a_this)->engine, 0, a_args);
     return S_OK;
 }
 
@@ -487,6 +593,107 @@ static ICoreWebView2NavigationStartingEventHandlerVtbl sbw_navigation_starting_v
     ICoreWebView2NavigationStartingEventHandler_sbw_add_ref,
     ICoreWebView2NavigationStartingEventHandler_sbw_release,
     sbw_on_navigation_starting
+};
+
+SBW_HANDLER_UNKNOWN (ICoreWebView2FrameNavigationStartingEventHandler)
+
+static HRESULT STDMETHODCALLTYPE sbw_on_frame_navigation_starting (ICoreWebView2FrameNavigationStartingEventHandler *a_this,
+        ICoreWebView2Frame *a_sender, ICoreWebView2NavigationStartingEventArgs *a_args) {
+    sbw_handler_t *l_self = (sbw_handler_t *) a_this;
+    sbw_navigation_starts (l_self->engine, l_self->extra + 1, a_args);
+    return S_OK;
+}
+
+static ICoreWebView2FrameNavigationStartingEventHandlerVtbl sbw_frame_navigation_starting_vtbl = {
+    ICoreWebView2FrameNavigationStartingEventHandler_sbw_query,
+    ICoreWebView2FrameNavigationStartingEventHandler_sbw_add_ref,
+    ICoreWebView2FrameNavigationStartingEventHandler_sbw_release,
+    sbw_on_frame_navigation_starting
+};
+
+/* --- FrameDestroyed and FrameCreated: the iframes of the page ----------------------------- */
+
+static void sbw_release_frame (int a_slot) {
+    if (a_slot >= 0 && a_slot < SBW_MAX_FRAMES && sbw_frames[a_slot].in_use) {
+        sbw_frames[a_slot].in_use = 0;
+        if (sbw_frames[a_slot].frame) { ICoreWebView2Frame2_Release (sbw_frames[a_slot].frame); }
+        sbw_frames[a_slot].frame = NULL;
+    }
+}
+
+SBW_HANDLER_UNKNOWN (ICoreWebView2FrameDestroyedEventHandler)
+
+static HRESULT STDMETHODCALLTYPE sbw_on_frame_destroyed (ICoreWebView2FrameDestroyedEventHandler *a_this,
+        ICoreWebView2Frame *a_sender, IUnknown *a_args) {
+    sbw_handler_t *l_self = (sbw_handler_t *) a_this;
+    if (sbw_frame (l_self->engine, l_self->extra + 1)) { sbw_release_frame (l_self->extra); }
+    return S_OK;
+}
+
+static ICoreWebView2FrameDestroyedEventHandlerVtbl sbw_frame_destroyed_vtbl = {
+    ICoreWebView2FrameDestroyedEventHandler_sbw_query,
+    ICoreWebView2FrameDestroyedEventHandler_sbw_add_ref,
+    ICoreWebView2FrameDestroyedEventHandler_sbw_release,
+    sbw_on_frame_destroyed
+};
+
+SBW_HANDLER_UNKNOWN (ICoreWebView2FrameCreatedEventHandler)
+
+static HRESULT STDMETHODCALLTYPE sbw_on_frame_created (ICoreWebView2FrameCreatedEventHandler *a_this,
+        ICoreWebView2 *a_sender, ICoreWebView2FrameCreatedEventArgs *a_args) {
+    sbw_handler_t *l_self = (sbw_handler_t *) a_this;
+    sbw_engine_t *l_engine = sbw_engine (l_self->engine);
+    ICoreWebView2Frame *l_frame = NULL;
+    ICoreWebView2Frame2 *l_frame_2 = NULL;
+    sbw_handler_t *l_handler;
+    EventRegistrationToken l_token;
+    int i, l_slot = -1;
+    if (!l_engine || l_engine->disposing) { return S_OK; }
+    if (FAILED (ICoreWebView2FrameCreatedEventArgs_get_Frame (a_args, &l_frame)) || !l_frame) { return S_OK; }
+    if (SUCCEEDED (ICoreWebView2Frame_QueryInterface (l_frame, &IID_ICoreWebView2Frame2, (void **) &l_frame_2)) && l_frame_2) {
+        for (i = 0; i < SBW_MAX_FRAMES && l_slot < 0; i++) {
+            if (!sbw_frames[i].in_use) { l_slot = i; }
+        }
+        if (l_slot >= 0) {
+            memset (&sbw_frames[l_slot], 0, sizeof (sbw_frame_t));
+            sbw_frames[l_slot].in_use = 1;
+            sbw_frames[l_slot].engine = l_self->engine;
+            sbw_frames[l_slot].frame = l_frame_2;
+            l_handler = sbw_new_handler (&sbw_frame_navigation_starting_vtbl,
+                &IID_ICoreWebView2FrameNavigationStartingEventHandler, l_self->engine, l_slot);
+            if (l_handler) {
+                ICoreWebView2Frame2_add_NavigationStarting (l_frame_2,
+                    (ICoreWebView2FrameNavigationStartingEventHandler *) l_handler, &l_token);
+                sbw_handler_release (l_handler);
+            }
+            l_handler = sbw_new_handler (&sbw_frame_message_vtbl,
+                &IID_ICoreWebView2FrameWebMessageReceivedEventHandler, l_self->engine, l_slot);
+            if (l_handler) {
+                ICoreWebView2Frame2_add_WebMessageReceived (l_frame_2,
+                    (ICoreWebView2FrameWebMessageReceivedEventHandler *) l_handler, &l_token);
+                sbw_handler_release (l_handler);
+            }
+            l_handler = sbw_new_handler (&sbw_frame_destroyed_vtbl,
+                &IID_ICoreWebView2FrameDestroyedEventHandler, l_self->engine, l_slot);
+            if (l_handler) {
+                ICoreWebView2Frame2_add_Destroyed (l_frame_2,
+                    (ICoreWebView2FrameDestroyedEventHandler *) l_handler, &l_token);
+                sbw_handler_release (l_handler);
+            }
+            sbw_log ("frame created engine=%d slot=%d", l_self->engine, l_slot);
+        } else {
+            ICoreWebView2Frame2_Release (l_frame_2);
+        }
+    }
+    ICoreWebView2Frame_Release (l_frame);
+    return S_OK;
+}
+
+static ICoreWebView2FrameCreatedEventHandlerVtbl sbw_frame_created_vtbl = {
+    ICoreWebView2FrameCreatedEventHandler_sbw_query,
+    ICoreWebView2FrameCreatedEventHandler_sbw_add_ref,
+    ICoreWebView2FrameCreatedEventHandler_sbw_release,
+    sbw_on_frame_created
 };
 
 /* --- NewWindowRequested: reported, never opened ------------------------------------------- */
@@ -640,6 +847,75 @@ static ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandlerVtbl sbw_
 
 /* --- WebResourceRequested: set_html_with_base answers its URL with the page --------------- */
 
+/* Append `a_text' (`a_n' bytes) to `a_out' with &, < and > escaped; `a_out' has room. */
+static size_t sbw_append_escaped (char *a_out, size_t a_at, const char *a_text, size_t a_n) {
+    size_t i;
+    for (i = 0; i < a_n; i++) {
+        if (a_text[i] == '&') { memcpy (a_out + a_at, "&amp;", 5); a_at += 5; }
+        else if (a_text[i] == '<') { memcpy (a_out + a_at, "&lt;", 4); a_at += 4; }
+        else if (a_text[i] == '>') { memcpy (a_out + a_at, "&gt;", 4); a_at += 4; }
+        else { a_out[a_at++] = a_text[i]; }
+    }
+    return a_at;
+}
+
+/* The echo page for `a_request': its method, a line break, its body, in <pre id="echo">. */
+static char *sbw_echo_page (ICoreWebView2WebResourceRequest *a_request) {
+    LPWSTR l_method = NULL;
+    char *l_method_8;
+    IStream *l_content = NULL;
+    char *l_body = NULL;
+    size_t l_count = 0, l_room = 0;
+    ULONG l_read;
+    char l_buffer[4096];
+    char *l_page;
+    size_t l_at;
+    const char *l_head = "<html><head><title>echo</title></head><body><pre id=\"echo\">";
+    const char *l_tail = "</pre></body></html>";
+    ICoreWebView2WebResourceRequest_get_Method (a_request, &l_method);
+    l_method_8 = sbw_utf8 (l_method);
+    if (l_method) { CoTaskMemFree (l_method); }
+    if (SUCCEEDED (ICoreWebView2WebResourceRequest_get_Content (a_request, &l_content)) && l_content) {
+        while (SUCCEEDED (l_content->lpVtbl->Read (l_content, l_buffer, sizeof (l_buffer), &l_read)) && l_read > 0) {
+            if (l_count + l_read > l_room) {
+                l_room = (l_count + l_read) * 2;
+                l_body = (char *) realloc (l_body, l_room);
+                if (!l_body) { l_count = 0; break; }
+            }
+            memcpy (l_body + l_count, l_buffer, l_read);
+            l_count += l_read;
+        }
+        l_content->lpVtbl->Release (l_content);
+    }
+    l_page = (char *) malloc (strlen (l_head) + strlen (l_tail) + 5 * (l_count + (l_method_8 ? strlen (l_method_8) : 0)) + 8);
+    if (l_page) {
+        l_at = 0;
+        memcpy (l_page, l_head, strlen (l_head));
+        l_at = strlen (l_head);
+        if (l_method_8) { l_at = sbw_append_escaped (l_page, l_at, l_method_8, strlen (l_method_8)); }
+        l_page[l_at++] = '\n';
+        if (l_body) { l_at = sbw_append_escaped (l_page, l_at, l_body, l_count); }
+        memcpy (l_page + l_at, l_tail, strlen (l_tail) + 1);
+    }
+    free (l_body);
+    free (l_method_8);
+    return l_page;
+}
+
+/* Answer `a_args' with the HTML `a_html'. */
+static void sbw_respond_html (sbw_engine_t *a_engine, ICoreWebView2WebResourceRequestedEventArgs *a_args, const char *a_html) {
+    ICoreWebView2WebResourceResponse *l_response = NULL;
+    IStream *l_stream = SHCreateMemStream ((const BYTE *) a_html, (UINT) strlen (a_html));
+    if (l_stream) {
+        if (SUCCEEDED (ICoreWebView2Environment_CreateWebResourceResponse (a_engine->environment, l_stream,
+                200, L"OK", L"Content-Type: text/html; charset=utf-8", &l_response)) && l_response) {
+            ICoreWebView2WebResourceRequestedEventArgs_put_Response (a_args, l_response);
+            ICoreWebView2WebResourceResponse_Release (l_response);
+        }
+        l_stream->lpVtbl->Release (l_stream);
+    }
+}
+
 SBW_HANDLER_UNKNOWN (ICoreWebView2WebResourceRequestedEventHandler)
 
 static HRESULT STDMETHODCALLTYPE sbw_on_resource (ICoreWebView2WebResourceRequestedEventHandler *a_this,
@@ -647,21 +923,19 @@ static HRESULT STDMETHODCALLTYPE sbw_on_resource (ICoreWebView2WebResourceReques
     sbw_handler_t *l_self = (sbw_handler_t *) a_this;
     sbw_engine_t *l_engine = sbw_engine (l_self->engine);
     ICoreWebView2WebResourceRequest *l_request = NULL;
-    ICoreWebView2WebResourceResponse *l_response = NULL;
-    IStream *l_stream;
     LPWSTR l_uri = NULL;
-    if (!l_engine || !l_engine->served_url || !l_engine->served_html || !l_engine->environment) { return S_OK; }
+    char *l_echo;
+    if (!l_engine || !l_engine->environment) { return S_OK; }
     if (SUCCEEDED (ICoreWebView2WebResourceRequestedEventArgs_get_Request (a_args, &l_request)) && l_request) {
-        if (SUCCEEDED (ICoreWebView2WebResourceRequest_get_Uri (l_request, &l_uri)) && l_uri
-                && wcscmp (l_uri, l_engine->served_url) == 0) {
-            l_stream = SHCreateMemStream ((const BYTE *) l_engine->served_html, (UINT) strlen (l_engine->served_html));
-            if (l_stream) {
-                if (SUCCEEDED (ICoreWebView2Environment_CreateWebResourceResponse (l_engine->environment, l_stream,
-                        200, L"OK", L"Content-Type: text/html; charset=utf-8", &l_response)) && l_response) {
-                    ICoreWebView2WebResourceRequestedEventArgs_put_Response (a_args, l_response);
-                    ICoreWebView2WebResourceResponse_Release (l_response);
+        if (SUCCEEDED (ICoreWebView2WebResourceRequest_get_Uri (l_request, &l_uri)) && l_uri) {
+            if (l_engine->served_url && l_engine->served_html && wcscmp (l_uri, l_engine->served_url) == 0) {
+                sbw_respond_html (l_engine, a_args, l_engine->served_html);
+            } else if (l_engine->echo_url && wcscmp (l_uri, l_engine->echo_url) == 0) {
+                l_echo = sbw_echo_page (l_request);
+                if (l_echo) {
+                    sbw_respond_html (l_engine, a_args, l_echo);
+                    free (l_echo);
                 }
-                l_stream->lpVtbl->Release (l_stream);
             }
         }
         if (l_uri) { CoTaskMemFree (l_uri); }
@@ -1003,11 +1277,18 @@ static void sbw_navigate (int a_id, const char *a_url) {
     webview_navigate (l_engine->w, a_url);
 }
 
-/* Load `a_html' as the document at `a_base': the URL is answered with the page. */
+/* Load `a_html' as the document at `a_base': the URL is answered with the page. set_html's base
+   comes from shared code (SB_SCRIPTS.set_html_base: https://simple-browser.invalid/page-N). Not
+   NavigateToString, whose data: URL page cannot even follow a link to about:blank. */
 static void sbw_set_html_with_base (int a_id, const char *a_html, const char *a_base) {
     sbw_engine_t *l_engine = sbw_engine (a_id);
     wchar_t *l_base;
-    if (!l_engine || !l_engine->view || !l_engine->environment) { return; }
+    if (!l_engine) { return; }
+    if (!l_engine->view || !l_engine->environment) {
+        l_engine->pass_pending = l_engine->pass_pending + 1;
+        webview_set_html (l_engine->w, a_html);
+        return;
+    }
     if (l_engine->served_url) {
         ICoreWebView2_RemoveWebResourceRequestedFilter (l_engine->view, l_engine->served_url,
                                                         COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
@@ -1024,23 +1305,50 @@ static void sbw_set_html_with_base (int a_id, const char *a_html, const char *a_
     free (l_base);
 }
 
-/* Load `a_html' as the page. Not NavigateToString: its data: URL page cannot follow a link
-   to about:blank at all (WebView2 starts no navigation), where a page loaded by WKWebView's
-   and WebKitGTK's load_html can. The page is served instead, at a URL of its own under the
-   reserved name simple-browser.invalid, which never reaches the network. */
-static void sbw_set_html (int a_id, const char *a_html) {
+/* Test hook: answer requests for `a_url' with the request's method and body. */
+static void sbw_set_echo (int a_id, const char *a_url) {
     sbw_engine_t *l_engine = sbw_engine (a_id);
-    char l_url[96];
-    if (!l_engine) { return; }
-    if (!l_engine->view || !l_engine->environment) {
-        l_engine->pass_pending = l_engine->pass_pending + 1;
-        webview_set_html (l_engine->w, a_html);
-        return;
+    if (!l_engine || !l_engine->view) { return; }
+    if (l_engine->echo_url) {
+        ICoreWebView2_RemoveWebResourceRequestedFilter (l_engine->view, l_engine->echo_url,
+                                                        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+        free (l_engine->echo_url);
     }
-    l_engine->page_serial = l_engine->page_serial + 1;
-    _snprintf (l_url, sizeof (l_url) - 1, "https://simple-browser.invalid/page-%d", l_engine->page_serial);
-    l_url[sizeof (l_url) - 1] = 0;
-    sbw_set_html_with_base (a_id, a_html, l_url);
+    l_engine->echo_url = sbw_wide (a_url);
+    if (l_engine->echo_url) {
+        ICoreWebView2_AddWebResourceRequestedFilter (l_engine->view, l_engine->echo_url,
+                                                     COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+    }
+}
+
+/* Let the next navigation of frame `a_frame' (0 the main frame) through: a replay the page
+   makes itself (a held form submitted again). */
+static void sbw_pass_next (int a_id, int a_frame) {
+    sbw_engine_t *l_engine = sbw_engine (a_id);
+    sbw_frame_t *l_frame = a_frame ? sbw_frame (a_id, a_frame) : NULL;
+    if (l_frame) {
+        l_frame->pass_pending = l_frame->pass_pending + 1;
+    } else if (l_engine && a_frame == 0) {
+        l_engine->pass_pending = l_engine->pass_pending + 1;
+    }
+}
+
+/* Run `a_script' in frame `a_frame' (0 the main frame); its result is discarded. */
+static void sbw_eval_in (int a_id, int a_frame, const char *a_script) {
+    sbw_engine_t *l_engine = sbw_engine (a_id);
+    sbw_frame_t *l_frame;
+    wchar_t *l_script;
+    if (!l_engine) { return; }
+    sbw_log ("eval in engine=%d frame=%d script=%.200s", a_id, a_frame, a_script ? a_script : "");
+    if (a_frame == 0) {
+        sbw_execute (l_engine, a_id, a_script, 0);
+    } else if ((l_frame = sbw_frame (a_id, a_frame)) != NULL) {
+        l_script = sbw_wide (a_script);
+        if (l_script) {
+            ICoreWebView2Frame2_ExecuteScript (l_frame->frame, l_script, NULL);
+            free (l_script);
+        }
+    }
 }
 
 static void sbw_set_deciding (int a_id, int a_on) {
@@ -1114,6 +1422,17 @@ static void sbw_register (sbw_engine_t *a_engine, int a_id) {
     SBW_ADD (WebResourceRequested, sbw_resource_vtbl, IID_ICoreWebView2WebResourceRequestedEventHandler, 0,
              ICoreWebView2WebResourceRequestedEventHandler)
 #undef SBW_ADD
+    {
+        ICoreWebView2_4 *l_view_4 = NULL;
+        if (SUCCEEDED (ICoreWebView2_QueryInterface (l_view, &IID_ICoreWebView2_4, (void **) &l_view_4)) && l_view_4) {
+            l_handler = sbw_new_handler (&sbw_frame_created_vtbl, &IID_ICoreWebView2FrameCreatedEventHandler, a_id, 0);
+            if (l_handler) {
+                ICoreWebView2_4_add_FrameCreated (l_view_4, (ICoreWebView2FrameCreatedEventHandler *) l_handler, &l_token);
+                sbw_handler_release (l_handler);
+            }
+            ICoreWebView2_4_Release (l_view_4);
+        }
+    }
 }
 
 /* A fresh folder in the temporary directory, for an ephemeral engine's user data. */
@@ -1259,6 +1578,9 @@ static void sbw_dispose (int a_id) {
         }
     }
     l_engine->disposing = 1;
+    for (i = 0; i < SBW_MAX_FRAMES; i++) {
+        if (sbw_frames[i].in_use && sbw_frames[i].engine == a_id) { sbw_release_frame (i); }
+    }
     for (i = 0; i < SBW_MAX_SCRIPTS; i++) {
         free (l_engine->scripts[i].id);
         l_engine->scripts[i].id = NULL;
@@ -1271,6 +1593,7 @@ static void sbw_dispose (int a_id) {
     wcscpy (l_folder, l_engine->data_folder);
     free (l_engine->served_url);
     free (l_engine->served_html);
+    free (l_engine->echo_url);
     sbw_free_event (l_engine->current);
     l_engine->current = NULL;
     l_engine->in_use = 0;
