@@ -83,9 +83,12 @@ the parse error as a JSON string.
 
 - `evaluate` takes one expression; promises are awaited; `undefined` gives `"null"`; a thrown error gives
   `ok` False and its message as a JSON string.
-- `on_navigation` is asked about navigations the page starts, never about the program's own `navigate` and
-  `set_html_content`.
+- `on_navigation` is asked about navigations the page starts, in the main frame and in iframes
+  (`is_main_frame` False), never about the program's own `navigate` and `set_html_content`.
 - `make_ephemeral` keeps cookies, storage and cache in memory, gone with the browser (the tests use it).
+- Every `set_html_content` page loads at `https://simple-browser.invalid/page-N` (`SB_SCRIPTS.set_html_base`)
+  on every platform, so its origin is `https://simple-browser.invalid`. The name is reserved and never reaches
+  the network.
 
 ### htmx and Alpine.js
 
@@ -114,14 +117,22 @@ Eiffel, on the thread that made the browser.
 
 ## Windows notes
 
-- WebView2's NavigationStarting takes no deferral, so a navigation the page starts is canceled at once and,
-  if `on_navigation` allows it, started again with the same URL (a GET; a form's POST body is not replayed).
-  Fragment-only navigations within a page are not reported by WebView2 and are not asked.
-- `set_html_content` serves the page at `https://simple-browser.invalid/page-N` (a reserved name that never
-  reaches the network) instead of webview.dll's data: URL, from which WebView2 cannot follow a link to
-  `about:blank`.
+- WebView2's NavigationStarting takes no deferral. What the page can show, the engine holds in the page
+  itself, through a document-start script of its own:
+  - a form submission (the submit event, or `HTMLFormElement.submit`) is held and, if allowed, submitted
+    again exactly, POST and body included;
+  - a fragment navigation within the page, which WebView2 does not report, is held through the Navigation
+    API.
+- What the page can't show (a script setting `location`, a server redirect) is canceled at once in
+  NavigationStarting and, if allowed, started again with the same URL. In an iframe (FrameCreated, then the
+  frame's own NavigationStarting) that is `location.assign` in the frame; an iframe's first load, its own
+  `src`, is part of the page and not asked.
+- `set_html_content` serves the page through WebResourceRequested instead of webview.dll's data: URL, from
+  which WebView2 cannot even follow a link to `about:blank`.
 - An ephemeral browser gets a fresh WebView2 user-data folder in the temporary directory, deleted on
   `dispose` (webview.dll makes the controller itself, without the options an InPrivate controller needs).
+  **Disposing an ephemeral browser can take a few seconds** (up to about 6.5 measured) while WebView2's
+  processes let go of the folder.
 
 ## Targets
 

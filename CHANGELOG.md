@@ -29,6 +29,15 @@ simple_browser off Windows, the shared code and the Windows engine (SIMPLE_BROWS
 - `WEBVIEW_ENGINE` moved to `src/windows` (a Windows-only cluster), over `Clib/windows/sb_win.h`.
   `make (a_ephemeral, a_debug)` and `make_with_window (a_parent, a_ephemeral, a_debug)`.
 - Facade commands that reach the engine now require `is_valid` (the engine already did).
+- Every `set_html` page loads at `https://simple-browser.invalid/page-N` (`SB_SCRIPTS.set_html_base`, numbered
+  by `BROWSER_ENGINE.new_set_html_base`) on every platform: one origin rule for all three.
+- Windows: navigation decisions without a deferral. Forms are held in the page and submitted again exactly
+  (POST and body); fragment navigations are held through the Navigation API; the rest is canceled in
+  NavigationStarting and started again if allowed. Iframe navigations are asked too (`is_main_frame` False).
+  The bridge and the bindings run in the main frame only, as on the other two.
+- Windows: disposing an ephemeral browser can take a few seconds (up to about 6.5 measured) while WebView2's
+  processes let go of its temporary data folder, which is then deleted.
+- Test hook `test_echo_at (url)`: requests for the URL are answered with their method and body.
 
 ## [Unreleased] - 2026-10-08
 

@@ -123,10 +123,11 @@ feature -- Navigation
 	set_html (a_html: READABLE_STRING_GENERAL)
 			-- <Precursor>
 		local
-			l_html: C_STRING
+			l_html, l_base: C_STRING
 		do
 			create l_html.make (utf_8 (a_html))
-			c_set_html (id, l_html.item)
+			create l_base.make (new_set_html_base)
+			c_set_html_with_base (id, l_html.item, l_base.item)
 		end
 
 feature -- Window configuration
@@ -178,7 +179,7 @@ feature -- Scripts
 			l_name, l_script: C_STRING
 		do
 			create l_name.make ("")
-			create l_script.make (utf_8 (a_script))
+			create l_script.make (main_frame_only (utf_8 (a_script)))
 			c_add_script (id, l_name.item, l_script.item)
 		end
 
@@ -189,7 +190,7 @@ feature -- Scripts
 		do
 			unbind_name (a_name)
 			create l_name.make (a_name)
-			create l_line.make (a_line)
+			create l_line.make (main_frame_only (a_line))
 			c_add_script (id, l_name.item, l_line.item)
 		end
 
@@ -247,19 +248,23 @@ feature -- Navigation decisions
 
 	decide (a_decision: INTEGER; a_allow: BOOLEAN)
 			-- <Precursor>
-			-- A fragment navigation (held by `Hint_script') is replayed on the page if allowed;
-			-- any other is replayed by sb_win.h.
+			-- A navigation `Hint_script' held on the page (a fragment, a form) is replayed there,
+			-- in its own frame, if allowed; any other is replayed by sb_win.h.
 		local
 			l_script: C_STRING
 		do
-			if a_decision >= Fragment_decision_base then
-				if attached fragment_decisions.item (a_decision) as al_url then
-					fragment_decisions.remove (a_decision)
+			if a_decision >= Page_decision_base then
+				if attached page_decisions.item (a_decision) as al_held then
+					page_decisions.remove (a_decision)
 					if a_allow then
-						create l_script.make ("window.__sb_win_replay = " + scripts.json_string_8 (al_url)
-							+ "; location.href = " + scripts.json_string_8 (al_url) + ";")
-						c_eval (id, l_script.item)
+						if al_held.pass then
+							c_pass_next (id, al_held.frame)
+						end
+						create l_script.make (al_held.replay)
+					else
+						create l_script.make (al_held.drop)
 					end
+					c_eval_in (id, al_held.frame, l_script.item)
 				end
 			else
 				c_decide (id, a_decision, a_allow.to_integer)
@@ -289,7 +294,7 @@ feature -- The loop
 				if c_take (id) then
 					l_kind := c_current_kind (id)
 					if l_kind = Message_kind then
-						Result := take_message (current_text (1))
+						Result := take_message (current_text (1), c_current_c (id))
 						l_done := Result
 					elseif is_event_kind (l_kind) then
 						if l_kind = Event_navigating then
@@ -322,7 +327,7 @@ feature -- Lifecycle
 				c_dispose (id)
 				id := 0
 			end
-			fragment_decisions.wipe_out
+			page_decisions.wipe_out
 		end
 
 feature -- Debug control
@@ -373,29 +378,41 @@ feature -- Test hooks
 			c_set_html_with_base (id, l_html.item, l_base.item)
 		end
 
+	test_echo_at (a_url: READABLE_STRING_GENERAL)
+			-- <Precursor>
+		local
+			l_url: C_STRING
+		do
+			create l_url.make (utf_8 (a_url))
+			c_set_echo (id, l_url.item)
+		end
+
 feature {NONE} -- Web messages
 
-	take_message (a_json: STRING_8): BOOLEAN
-			-- Make the web message `a_json' the event last taken, if it is a call or a result;
-			-- keep it as `hint_url' and `hint_kind' if it is a navigation-kind hint.
+	take_message (a_json: STRING_8; a_frame: INTEGER): BOOLEAN
+			-- Make the web message `a_json' from frame `a_frame' (0 the main frame) the event last
+			-- taken, if it is a call or a result (main frame only, as the bridge is) or a
+			-- navigation held on the page; keep it as `hint_url' and `hint_kind' if it is a
+			-- navigation-kind hint.
 		local
 			l_json: SIMPLE_JSON
 			l_utf: UTF_CONVERTER
 			l_ticket, l_status: INTEGER
-			l_result: STRING_8
+			l_result, l_url: STRING_8
 		do
 			create l_json
 			if not a_json.is_empty and then attached l_json.parse (l_utf.utf_8_string_8_to_string_32 (a_json)) as al_value
 				and then al_value.is_object
 			then
 				if attached al_value.as_object as al_object then
-					if attached al_object.string_item ("name") as al_name and attached al_object.string_item ("seq") as al_seq
+					if a_frame = 0 and attached al_object.string_item ("name") as al_name
+						and attached al_object.string_item ("seq") as al_seq
 						and attached al_object.string_item ("args") as al_args
 					then
 						set_event (Event_call, 0, 0, 0, l_utf.utf_32_string_to_utf_8_string_8 (al_name),
 							l_utf.utf_32_string_to_utf_8_string_8 (al_seq), l_utf.utf_32_string_to_utf_8_string_8 (al_args))
 						Result := True
-					elseif attached al_object.item ("sb_ticket") as al_ticket and then al_ticket.is_number then
+					elseif a_frame = 0 and attached al_object.item ("sb_ticket") as al_ticket and then al_ticket.is_number then
 						l_ticket := al_ticket.as_integer.to_integer_32
 						l_status := 1
 						if attached al_object.item ("status") as al_status and then al_status.is_number then
@@ -410,8 +427,18 @@ feature {NONE} -- Web messages
 							create {STRING_8}.make_empty)
 						Result := True
 					elseif attached al_object.string_item ("sb_fragment") as al_fragment then
-						Result := take_fragment (l_utf.utf_32_string_to_utf_8_string_8 (al_fragment),
-							al_object.integer_32_item ("kind"))
+						l_url := l_utf.utf_32_string_to_utf_8_string_8 (al_fragment)
+						Result := take_page_decision (l_url, al_object.integer_32_item ("kind"), a_frame,
+							"window.__sb_win_replay = " + scripts.json_string_8 (l_url) + "; location.href = "
+								+ scripts.json_string_8 (l_url) + ";",
+							"", False)
+					elseif attached al_object.item ("sb_form") as al_form and then al_form.is_number
+						and attached al_object.string_item ("url") as al_form_url
+					then
+						l_url := l_utf.utf_32_string_to_utf_8_string_8 (al_form_url)
+						Result := take_page_decision (l_url, {SB_NAVIGATION}.Kind_form, a_frame,
+							"window.__sb_win_replay_form (" + al_form.as_integer.out + ");",
+							"window.__sb_win_drop_form (" + al_form.as_integer.out + ");", True)
 					elseif attached al_object.item ("sb_hint") as al_hint and then al_hint.is_number
 						and attached al_object.string_item ("url") as al_url
 					then
@@ -422,39 +449,54 @@ feature {NONE} -- Web messages
 			end
 		end
 
-	take_fragment (a_url: STRING_8; a_kind: INTEGER): BOOLEAN
-			-- Make the fragment navigation to `a_url' that `Hint_script' held a `navigating'
-			-- event, under a decision number of this engine's own.
+	take_page_decision (a_url: STRING_8; a_kind, a_frame: INTEGER; a_replay, a_drop: STRING_8; a_pass: BOOLEAN): BOOLEAN
+			-- Make the navigation to `a_url' that `Hint_script' held in frame `a_frame' a
+			-- `navigating' event, under a decision number of this engine's own. `decide' runs
+			-- `a_replay' there if allowed (after letting the frame's next navigation through
+			-- if `a_pass'), else `a_drop'.
 		local
 			l_kind: INTEGER
 		do
 			if is_deciding then
-				last_fragment_decision := last_fragment_decision + 1
-				fragment_decisions.force (a_url, last_fragment_decision)
+				last_page_decision := last_page_decision.max (Page_decision_base - 1) + 1
+				page_decisions.force ([a_replay, a_drop, a_frame, a_pass], last_page_decision)
 				l_kind := navigation_kind (a_url)
 				if l_kind = 0 and a_kind >= 0 and a_kind <= 4 then
 					l_kind := a_kind
 				end
-				set_event (Event_navigating, last_fragment_decision, l_kind, 1, a_url,
+				set_event (Event_navigating, last_page_decision, l_kind, (a_frame = 0).to_integer, a_url,
 					create {STRING_8}.make_empty, create {STRING_8}.make_empty)
 				Result := True
+			elseif not a_replay.is_empty then
+					-- Asked while no handler was set (the flag was late): allow at once.
+				if a_pass then
+					c_pass_next (id, a_frame)
+				end
+				c_eval_in (id, a_frame, (create {C_STRING}.make (a_replay)).item)
 			end
 		end
 
-	fragment_decisions: HASH_TABLE [STRING_8, INTEGER]
-			-- Fragment navigations held on the page, by decision number: their urls (UTF-8).
+	page_decisions: HASH_TABLE [TUPLE [replay, drop: STRING_8; frame: INTEGER; pass: BOOLEAN], INTEGER]
+			-- Navigations held on the page, by decision number: what allowing and refusing run.
 		attribute
 			create Result.make (4)
 		end
 
-	last_fragment_decision: INTEGER
-			-- The last decision number given to a fragment navigation.
-		attribute
-			Result := Fragment_decision_base - 1
-		end
+	last_page_decision: INTEGER
+			-- The last decision number given to a navigation held on the page (0 before the
+			-- first; numbers start at `Page_decision_base').
 
-	Fragment_decision_base: INTEGER = 1_000_000_000
-			-- Decision numbers of fragment navigations start here (sb_win.h's stay below).
+	Page_decision_base: INTEGER = 1_000_000_000
+			-- Decision numbers of navigations held on the page start here (sb_win.h's stay below).
+
+	main_frame_only (a_script: STRING_8): STRING_8
+			-- `a_script' run only in the main frame (as WKWebView's and WebKitGTK's user scripts
+			-- are): WebView2 runs document-start scripts in every frame.
+		do
+			Result := "if (window === window.top) {%N" + a_script + "%N}"
+		ensure
+			holds_the_script: Result.has_substring (a_script)
+		end
 
 	Asks_name: STRING_8 = "__sb_win_asks"
 			-- The name of the document-start script that sets `window.__sb_win_asks'.
@@ -545,13 +587,62 @@ feature {NONE} -- Implementation
     const link = event.target.closest ("a[href]");
     if (link && typeof link.href === "string") { post ({sb_hint: 1, url: link.href}); }
   });
+  const forms = new Map ();
+  let form_serial = 0;
+  const native_submit = HTMLFormElement.prototype.submit;
+  const form_target = (form, submitter) => {
+    const target = (submitter && submitter.formTarget) || form.target || "";
+    return target === "" || target === "_self";
+  };
+  const form_method = (form, submitter) =>
+    String ((submitter && submitter.hasAttribute ("formmethod") && submitter.formMethod) || form.method || "get").toLowerCase ();
+  const form_url = (form, submitter) => {
+    const action = (submitter && submitter.hasAttribute ("formaction")) ? submitter.formAction : form.action;
+    if (form_method (form, submitter) !== "get") { return action; }
+    const url = new URL (action);
+    url.search = new URLSearchParams (submitter ? new FormData (form, submitter) : new FormData (form)).toString ();
+    return url.href;
+  };
+  const holds = (form, submitter) =>
+    window.__sb_win_asks === true && form_target (form, submitter) && form_method (form, submitter) !== "dialog";
+  const hold_form = (form, submitter, native) => {
+    form_serial = form_serial + 1;
+    forms.set (form_serial, {form: form, submitter: submitter, native: native});
+    post ({sb_form: form_serial, url: form_url (form, submitter)});
+  };
+  Object.defineProperty (window, "__sb_win_replay_form", {value: (serial) => {
+    const held = forms.get (serial);
+    if (held === undefined) { return; }
+    forms.delete (serial);
+    held.form.__sb_win_pass = true;
+    if (held.native) {
+      native_submit.call (held.form);
+      held.form.__sb_win_pass = false;
+    } else if (held.submitter && held.submitter.isConnected) {
+      held.form.requestSubmit (held.submitter);
+    } else {
+      held.form.requestSubmit ();
+    }
+  }});
+  Object.defineProperty (window, "__sb_win_drop_form", {value: (serial) => { forms.delete (serial); }});
+  HTMLFormElement.prototype.submit = function () {
+    if (this.__sb_win_pass !== true && holds (this, null)) { hold_form (this, null, true); return; }
+    return native_submit.call (this);
+  };
   window.addEventListener ("submit", (event) => {
     if (event.defaultPrevented || !event.target) { return; }
-    if (typeof event.target.action === "string") { post ({sb_hint: 2, url: event.target.action}); }
+    const form = event.target;
+    if (form.__sb_win_pass === true) { form.__sb_win_pass = false; return; }
+    if (holds (form, event.submitter)) {
+      event.preventDefault ();
+      hold_form (form, event.submitter || null, false);
+    } else if (typeof form.action === "string") {
+      post ({sb_hint: 2, url: form.action});
+    }
   });
   if (window.navigation && window.navigation.addEventListener) {
     window.navigation.addEventListener ("navigate", (event) => {
-      if (window.__sb_win_asks !== true || !event.hashChange || !event.cancelable) { return; }
+      if (window.__sb_win_asks !== true || !event.hashChange || !event.cancelable || event.formData) { return; }
       const url = event.destination.url;
       if (window.__sb_win_replay === url) { window.__sb_win_replay = undefined; return; }
       event.preventDefault ();
@@ -565,7 +656,11 @@ feature {NONE} -- Implementation
 			--   navigation it starts (WebView2 1.0.1150 does not tell a link from a form);
 			-- - while `window.__sb_win_asks' (`set_deciding'), a fragment navigation within the
 			--   page, which WebView2 does not report, held through the Navigation API and
-			--   reported for `decide'.
+			--   reported for `decide';
+			-- - while `window.__sb_win_asks', a form submission (the submit event, or
+			--   HTMLFormElement.submit), held on the page and submitted again exactly (POST and
+			--   body included) if `decide' allows it, since a replay by URL would lose the body.
+			-- It runs in every frame; the bridge and the bindings run in the main frame only.
 
 feature {NONE} -- C externals
 
@@ -597,11 +692,25 @@ feature {NONE} -- C externals
 			"sbw_navigate ((int) $a_id, (const char *) $a_url);"
 		end
 
-	c_set_html (a_id: INTEGER; a_html: POINTER)
+	c_set_echo (a_id: INTEGER; a_url: POINTER)
 		external
 			"C inline use %"sb_win.h%""
 		alias
-			"sbw_set_html ((int) $a_id, (const char *) $a_html);"
+			"sbw_set_echo ((int) $a_id, (const char *) $a_url);"
+		end
+
+	c_pass_next (a_id, a_frame: INTEGER)
+		external
+			"C inline use %"sb_win.h%""
+		alias
+			"sbw_pass_next ((int) $a_id, (int) $a_frame);"
+		end
+
+	c_eval_in (a_id, a_frame: INTEGER; a_script: POINTER)
+		external
+			"C inline use %"sb_win.h%""
+		alias
+			"sbw_eval_in ((int) $a_id, (int) $a_frame, (const char *) $a_script);"
 		end
 
 	c_set_html_with_base (a_id: INTEGER; a_html, a_base: POINTER)
