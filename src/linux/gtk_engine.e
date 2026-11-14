@@ -35,7 +35,9 @@ class
 inherit
 	BROWSER_ENGINE
 		redefine
-			set_debug_mode
+			set_debug_mode,
+			test_sees_request_body,
+			test_request_body_limit
 		end
 
 create
@@ -344,6 +346,21 @@ feature -- Test hooks
 			create l_html.make (utf_8 (a_html))
 			create l_base.make (utf_8 (a_base_url))
 			c_set_html_with_base (id, l_html.item, l_base.item)
+		end
+
+	test_sees_request_body: BOOLEAN
+			-- <Precursor>
+			-- No: measured on WebKitGTK 2.52, WebKitURIRequest has a method and headers but no
+			-- body, and a URI scheme handler for https is refused. A held decision, once used,
+			-- still sends WebKit's own request, body included.
+		do
+			Result := False
+		end
+
+	test_request_body_limit: STRING_8
+			-- <Precursor>
+		do
+			Result := "WebKitGTK 2.52's WebKitURIRequest has no body, and https URI scheme handlers are refused"
 		end
 
 	test_echo_at (a_url: READABLE_STRING_GENERAL)

@@ -296,6 +296,20 @@ feature -- Test hooks
 		deferred
 		end
 
+	test_sees_request_body: BOOLEAN
+			-- Can `test_echo_at''s page show a request's body? A limit of the test, not of the
+			-- browser: an engine whose toolkit hides the body from the program (while still
+			-- sending it) redefines this False and says why in `test_request_body_limit'.
+		do
+			Result := True
+		end
+
+	test_request_body_limit: STRING_8
+			-- Why `test_echo_at''s page cannot show a request's body, if it cannot; empty otherwise.
+		do
+			create Result.make_empty
+		end
+
 feature -- Queries
 
 	is_json_text (a_text: READABLE_STRING_8): BOOLEAN

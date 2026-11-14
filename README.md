@@ -134,6 +134,21 @@ Eiffel, on the thread that made the browser.
   **Disposing an ephemeral browser can take a few seconds** (up to about 6.5 measured) while WebView2's
   processes let go of the folder.
 
+## Platform notes
+
+Named deviations (SIMPLE_BROWSER_SPEC.md 4.8), where the platforms differ for a measured reason:
+
+- **Linux: the form test can't see a request's body.** On WebKitGTK 2.52 a held navigation decision is
+  WebKit's own request, let go unchanged, so a form's POST and body reach the server. But the program can't
+  read that body: `WebKitURIRequest` has a method and headers and no body, and a URI scheme handler for
+  `https` is refused. `test_a_form_is_held_and_submitted` checks the body only where
+  `BROWSER_ENGINE.test_sees_request_body` holds; on Linux it checks the method (POST) and says why.
+- **Linux: an iframe's own script setting `location` is reported as a main-frame navigation.** WebKitGTK's
+  navigation action has no frame or source frame, so the engine's own script, in every frame, tells it what
+  an iframe starts itself (a link or a form in it) and what a parent starts (setting an iframe's `src`).
+  `Location` can't be wrapped, and the Navigation API's navigate event fires only after the policy decision
+  there, so a script-set `location` in an iframe gives no hint.
+
 ## Targets
 
 | Target | Description |
