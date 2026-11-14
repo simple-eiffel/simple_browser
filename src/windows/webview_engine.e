@@ -582,11 +582,34 @@ feature {NONE} -- Implementation
   const post = (message) => {
     if (window.chrome && window.chrome.webview) { window.chrome.webview.postMessage (message); }
   };
+  let last_link = undefined;
   window.addEventListener ("click", (event) => {
     if (event.defaultPrevented || !event.target || !event.target.closest) { return; }
     const link = event.target.closest ("a[href]");
-    if (link && typeof link.href === "string") { post ({sb_hint: 1, url: link.href}); }
+    if (link && typeof link.href === "string") {
+      last_link = link.href;
+      post ({sb_hint: 1, url: link.href});
+    }
   });
+  const parent_sets = (frame, change) => {
+    let child = null;
+    try { child = frame.contentWindow; if (child) { child.__sb_win_parent_sets = true; } } catch (e) { child = null; }
+    try { return change (); } finally { try { if (child) { child.__sb_win_parent_sets = false; } } catch (e) { } }
+  };
+  ["src", "srcdoc"].forEach ((name) => {
+    const property = Object.getOwnPropertyDescriptor (HTMLIFrameElement.prototype, name);
+    if (property && property.set) {
+      Object.defineProperty (HTMLIFrameElement.prototype, name, {configurable: true, enumerable: property.enumerable,
+        get: property.get, set: function (value) { parent_sets (this, () => property.set.call (this, value)); }});
+    }
+  });
+  const set_attribute = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function (name, value) {
+    if (this instanceof HTMLIFrameElement && /^(src|srcdoc)$/i.test (String (name))) {
+      return parent_sets (this, () => set_attribute.call (this, name, value));
+    }
+    return set_attribute.call (this, name, value);
+  };
   const forms = new Map ();
   let form_serial = 0;
   const native_submit = HTMLFormElement.prototype.submit;
@@ -642,8 +665,19 @@ feature {NONE} -- Implementation
   });
   if (window.navigation && window.navigation.addEventListener) {
     window.navigation.addEventListener ("navigate", (event) => {
-      if (window.__sb_win_asks !== true || !event.hashChange || !event.cancelable || event.formData) { return; }
       const url = event.destination.url;
+      if (window.__sb_win_parent_sets === true) { return; }
+      if (!event.hashChange) {
+        // An iframe's own script setting location: reported from inside the frame, so the
+        // frame's NavigationStarting knows the frame started it (not its parent page).
+        if (window !== window.top && !event.formData && url !== last_link
+            && event.navigationType !== "traverse" && event.navigationType !== "reload") {
+          post ({sb_hint: 0, url: url});
+        }
+        last_link = undefined;
+        return;
+      }
+      if (window.__sb_win_asks !== true || !event.cancelable || event.formData) { return; }
       if (window.__sb_win_replay === url) { window.__sb_win_replay = undefined; return; }
       event.preventDefault ();
       post ({sb_fragment: url, kind: event.navigationType === "traverse" ? 3 : 0});
@@ -660,6 +694,9 @@ feature {NONE} -- Implementation
 			-- - while `window.__sb_win_asks', a form submission (the submit event, or
 			--   HTMLFormElement.submit), held on the page and submitted again exactly (POST and
 			--   body included) if `decide' allows it, since a replay by URL would lose the body.
+			-- - from inside an iframe, the start of the frame's own navigation (a link, its own
+			--   script setting location), so that only those are asked; a parent page setting
+			--   the iframe's src or srcdoc (patched setters flag the child) is not;
 			-- It runs in every frame; the bridge and the bindings run in the main frame only.
 
 feature {NONE} -- C externals

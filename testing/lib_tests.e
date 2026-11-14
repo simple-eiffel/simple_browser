@@ -171,7 +171,8 @@ feature -- Tests (shared, SIMPLE_BROWSER_SPEC.md section 5)
 	test_a_navigation_is_held_and_answered
 			-- The handler cancels about:blank#blocked and allows about:blank#allowed; the page
 			-- clicks a link to each; `location.hash' is then "#allowed"; both were links in the
-			-- main frame. A link inside an iframe is asked too, not in the main frame.
+			-- main frame. A link inside an iframe is asked too, not in the main frame; the parent
+			-- page setting an iframe's srcdoc or src is not asked.
 		local
 			l_browser: SIMPLE_BROWSER
 		do
@@ -183,11 +184,16 @@ feature -- Tests (shared, SIMPLE_BROWSER_SPEC.md section 5)
 				<a id="blocked" href="about:blank#blocked">blocked</a>
 				<a id="allowed" href="about:blank#allowed">allowed</a>
 				<iframe id="frame" srcdoc="<a id=&quot;inner&quot; href=&quot;about:blank#inner&quot;>inner</a>"></iframe>
+				<iframe id="plain" src="about:blank"></iframe>
 				<script>
 				setTimeout (() => {
 				  document.getElementById ("frame").contentDocument.getElementById ("inner").click ();
-				  setTimeout (() => document.getElementById ("blocked").click (), 500);
-				  setTimeout (() => document.getElementById ("allowed").click (), 1000);
+				  setTimeout (() => {
+				    document.getElementById ("frame").srcdoc = "<p>second</p>";
+				    document.getElementById ("plain").src = "about:blank#parent";
+				  }, 500);
+				  setTimeout (() => document.getElementById ("blocked").click (), 1000);
+				  setTimeout (() => document.getElementById ("allowed").click (), 1500);
 				}, 300);
 				</script>
 				</body></html>
@@ -202,6 +208,8 @@ feature -- Tests (shared, SIMPLE_BROWSER_SPEC.md section 5)
 			else
 				assert ("asked about the iframe's #inner", False)
 			end
+			refute ("the parent setting srcdoc is not asked", asked.has ("about:srcdoc"))
+			refute ("the parent setting src is not asked", asked.has ("about:blank#parent"))
 			assert_equal ("location.hash", "ok %"#allowed%"", results.item ("hash"))
 		end
 
