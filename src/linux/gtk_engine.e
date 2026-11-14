@@ -12,9 +12,12 @@ note
 		- `evaluate': webkit_web_view_call_async_javascript_function with the shared body, in
 		  the page's world.
 		- Navigation decisions: decide-policy holds the WebKitPolicyDecision (referenced) until
-		  `decide'. WebKitGTK 6.0 has no main-frame flag on a navigation action, and its frame
-		  name is NULL for the main frame and for unnamed and named iframes alike (measured), so
-		  every navigation reports main frame: the named deviation of spec 4.8.
+		  `decide', so an allowed form is WebKit's own request, POST and body. WebKitGTK 6.0's
+		  navigation action has no frame or source frame (its frame name, the target's, is NULL
+		  for the main frame and for unnamed and named iframes alike: measured), so the engine's
+		  frame script, in every frame, tells sb_gtk.h which navigations an iframe starts itself
+		  (asked, not main frame) and which a parent starts by setting an iframe's src (not
+		  asked).
 		- New windows: a NEW_WINDOW_ACTION decision is ignored and reported; `create' returns
 		  NULL (window.open, which reaches only `create', is reported there).
 		- The title: notify::title. The end of a load: load-changed and load-failed, with
@@ -134,11 +137,13 @@ feature -- Navigation
 
 	set_html (a_html: READABLE_STRING_GENERAL)
 			-- <Precursor>
+			-- webkit_web_view_load_html with `new_set_html_base' as the base URI.
 		local
-			l_html: C_STRING
+			l_html, l_base: C_STRING
 		do
 			create l_html.make (utf_8 (a_html))
-			c_set_html (id, l_html.item)
+			create l_base.make (new_set_html_base)
+			c_set_html_with_base (id, l_html.item, l_base.item)
 		end
 
 feature -- Window configuration
@@ -177,22 +182,24 @@ feature -- Scripts
 
 	init_js (a_script: READABLE_STRING_GENERAL)
 			-- <Precursor>
+			-- In every frame (WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES).
 		local
 			l_name, l_script: C_STRING
 		do
 			create l_name.make ("")
 			create l_script.make (utf_8 (a_script))
-			c_add_script (id, l_name.item, l_script.item, 0)
+			c_add_script (id, l_name.item, l_script.item, 0, 1)
 		end
 
 	set_bridge (a_script: READABLE_STRING_GENERAL)
 			-- <Precursor>
+			-- In the top frame only, as every binding.
 		local
 			l_name, l_script: C_STRING
 		do
 			create l_name.make ("")
 			create l_script.make (utf_8 (a_script))
-			c_add_script (id, l_name.item, l_script.item, 1)
+			c_add_script (id, l_name.item, l_script.item, 1, 0)
 		end
 
 	bind_name (a_name, a_line: STRING_8)
@@ -203,7 +210,7 @@ feature -- Scripts
 			unbind_name (a_name)
 			create l_name.make (a_name)
 			create l_line.make (a_line)
-			c_add_script (id, l_name.item, l_line.item, 1)
+			c_add_script (id, l_name.item, l_line.item, 1, 0)
 		end
 
 	unbind_name (a_name: STRING_8)
@@ -339,6 +346,18 @@ feature -- Test hooks
 			c_set_html_with_base (id, l_html.item, l_base.item)
 		end
 
+	test_echo_at (a_url: READABLE_STRING_GENERAL)
+			-- <Precursor>
+			-- A request for `a_url' is answered, at decide-policy, with the echo page loaded
+			-- by webkit_web_view_load_html. WebKitGTK 6.0 (2.52) gives the request its method
+			-- but not its body, so the body shown is empty.
+		local
+			l_url: C_STRING
+		do
+			create l_url.make (utf_8 (a_url))
+			c_set_echo (id, l_url.item)
+		end
+
 feature {NONE} -- Implementation
 
 	id: INTEGER
@@ -403,11 +422,11 @@ feature {NONE} -- C externals
 			"sbg_navigate ((int) $a_id, (const char *) $a_url);"
 		end
 
-	c_set_html (a_id: INTEGER; a_html: POINTER)
+	c_set_echo (a_id: INTEGER; a_url: POINTER)
 		external
 			"C inline use %"sb_gtk.h%""
 		alias
-			"sbg_set_html ((int) $a_id, (const char *) $a_html);"
+			"sbg_set_echo ((int) $a_id, (const char *) $a_url);"
 		end
 
 	c_set_html_with_base (a_id: INTEGER; a_html, a_base: POINTER)
@@ -445,11 +464,11 @@ feature {NONE} -- C externals
 			"sbg_eval ((int) $a_id, (const char *) $a_script);"
 		end
 
-	c_add_script (a_id: INTEGER; a_name, a_script: POINTER; a_now: INTEGER)
+	c_add_script (a_id: INTEGER; a_name, a_script: POINTER; a_now, a_all_frames: INTEGER)
 		external
 			"C inline use %"sb_gtk.h%""
 		alias
-			"sbg_add_script ((int) $a_id, (const char *) $a_name, (const char *) $a_script, (int) $a_now);"
+			"sbg_add_script ((int) $a_id, (const char *) $a_name, (const char *) $a_script, (int) $a_now, (int) $a_all_frames);"
 		end
 
 	c_remove_script (a_id: INTEGER; a_name: POINTER)

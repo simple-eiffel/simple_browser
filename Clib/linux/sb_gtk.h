@@ -72,7 +72,16 @@ typedef struct {
     int in_use;
     char *name;               /* the binding's name; NULL for the bridge and init scripts */
     char *source;
+    int all_frames;           /* every frame (init scripts, the frame script), else the top frame */
 } sbg_script_t;
+
+typedef struct {
+    int kind;                 /* SBG_HINT_FRAME or SBG_HINT_PARENT */
+    char *uri;                /* normalized; NULL when the slot is free */
+    gint64 at;                /* when it came, monotonic microseconds */
+} sbg_hint_t;
+
+#define SBG_MAX_HINTS 16
 
 typedef struct {
     int in_use;
@@ -92,7 +101,8 @@ typedef struct {
     int pass_active;          /* a load let through is under way: its redirects pass too */
     int load_failed;          /* load-failed came for the load under way */
     int has_page;             /* has a load been started? (scripts run "now" only on a page) */
-    int page_serial;          /* set_html's pages, numbered */
+    char *echo_url;           /* test_echo_at's URL (normalized), or NULL */
+    sbg_hint_t hints[SBG_MAX_HINTS];  /* the frame script's hints, newest kept */
     int min_w, min_h, max_w, max_h, fixed;  /* size hints, logical pixels; 0 = none */
     int width, height;        /* the content size last asked for */
     sbg_script_t scripts[SBG_MAX_SCRIPTS];
@@ -104,12 +114,16 @@ typedef struct {
     int engine;
     int number;
     WebKitPolicyDecision *decision;  /* referenced while held */
+    int kind;                 /* BROWSER_ENGINE's navigation kind */
+    char *uri;
+    char *method;
+    int echo;                 /* a request for test_echo_at's URL */
 } sbg_held_t;
 
 typedef struct {
     int engine;
     unsigned int serial;
-    int ticket;
+    int ticket;               /* the evaluate's ticket, or the decision number being classified */
 } sbg_evaluation_t;
 
 SBG_SHARED sbg_engine_t sbg_engines[SBG_MAX_ENGINES] = {{0}};
@@ -324,8 +338,63 @@ static void sbg_drop_events (int a_id) {
 /* Navigation decisions                                                                       */
 /* ------------------------------------------------------------------------------------------ */
 
+/* The kinds of frame hint the engine's frame script posts (channel sb_gtk_frame). */
+#define SBG_HINT_FRAME 1      /* a frame started a navigation of its own (link, form, script) */
+#define SBG_HINT_PARENT 2     /* a page set an iframe's src: the iframe's navigation, not asked */
+#define SBG_HINT_LIFE_US 3000000
+
+/* Keep frame hint `a_kind' for `a_uri' (normalized) on engine `a_engine'. */
+static void sbg_add_hint (sbg_engine_t *a_engine, int a_kind, const char *a_uri) {
+    int i, l_slot = 0;
+    gint64 l_oldest = G_MAXINT64;
+    for (i = 0; i < SBG_MAX_HINTS; i++) {
+        if (!a_engine->hints[i].uri) { l_slot = i; break; }
+        if (a_engine->hints[i].at < l_oldest) { l_oldest = a_engine->hints[i].at; l_slot = i; }
+    }
+    g_free (a_engine->hints[l_slot].uri);
+    a_engine->hints[l_slot].kind = a_kind;
+    a_engine->hints[l_slot].uri = sbg_normalized_uri (a_uri);
+    a_engine->hints[l_slot].at = g_get_monotonic_time ();
+}
+
+/* Take the oldest live hint of `a_kind' for `a_uri'; 0 if there is none. */
+static int sbg_take_hint (sbg_engine_t *a_engine, int a_kind, const char *a_uri) {
+    char *l_uri = sbg_normalized_uri (a_uri);
+    gint64 l_now = g_get_monotonic_time ();
+    int i, l_found = -1;
+    for (i = 0; i < SBG_MAX_HINTS; i++) {
+        if (a_engine->hints[i].uri && l_now - a_engine->hints[i].at > SBG_HINT_LIFE_US) {
+            g_free (a_engine->hints[i].uri);
+            a_engine->hints[i].uri = NULL;
+        }
+        if (a_engine->hints[i].uri && a_engine->hints[i].kind == a_kind && strcmp (a_engine->hints[i].uri, l_uri) == 0
+                && (l_found < 0 || a_engine->hints[i].at < a_engine->hints[l_found].at)) {
+            l_found = i;
+        }
+    }
+    g_free (l_uri);
+    if (l_found >= 0) {
+        g_free (a_engine->hints[l_found].uri);
+        a_engine->hints[l_found].uri = NULL;
+        return 1;
+    }
+    return 0;
+}
+
+/* The held entry of decision `a_number' of engine `a_engine', or NULL. */
+static sbg_held_t *sbg_held_entry (int a_engine, int a_number) {
+    int i;
+    for (i = 0; i < SBG_MAX_HELD; i++) {
+        if (sbg_held[i].in_use && sbg_held[i].engine == a_engine && sbg_held[i].number == a_number) {
+            return &sbg_held[i];
+        }
+    }
+    return NULL;
+}
+
 /* Hold `a_decision' for engine `a_engine' under a new decision number; 0 if there is no room. */
-static int sbg_hold (int a_engine, WebKitPolicyDecision *a_decision) {
+static int sbg_hold (int a_engine, WebKitPolicyDecision *a_decision, int a_kind, const char *a_uri,
+                     const char *a_method, int a_echo) {
     int i;
     for (i = 0; i < SBG_MAX_HELD; i++) {
         if (!sbg_held[i].in_use) {
@@ -335,30 +404,75 @@ static int sbg_hold (int a_engine, WebKitPolicyDecision *a_decision) {
             sbg_held[i].engine = a_engine;
             sbg_held[i].number = sbg_next_decision;
             sbg_held[i].decision = g_object_ref (a_decision);
+            sbg_held[i].kind = a_kind;
+            sbg_held[i].uri = g_strdup (a_uri ? a_uri : "");
+            sbg_held[i].method = g_strdup (a_method ? a_method : "GET");
+            sbg_held[i].echo = a_echo;
             return sbg_next_decision;
         }
     }
     return 0;
 }
 
+/* Release held entry `a_held' (its decision already answered). */
+static void sbg_release_held (sbg_held_t *a_held) {
+    g_object_unref (a_held->decision);
+    g_free (a_held->uri);
+    g_free (a_held->method);
+    memset (a_held, 0, sizeof (sbg_held_t));
+}
+
+static void sbg_set_pass (sbg_engine_t *a_engine, const char *a_uri);
+
+/* `a_text' with HTML's special characters escaped; g_free it. */
+static char *sbg_html_text (const char *a_text) {
+    return g_markup_escape_text (a_text ? a_text : "", -1);
+}
+
+/* Is `a_uri' the URL `test_echo_at' answers? */
+static int sbg_is_echo (sbg_engine_t *a_engine, const char *a_uri) {
+    char *l_uri;
+    int l_result = 0;
+    if (a_engine->echo_url && a_uri) {
+        l_uri = sbg_normalized_uri (a_uri);
+        l_result = strcmp (l_uri, a_engine->echo_url) == 0;
+        g_free (l_uri);
+    }
+    return l_result;
+}
+
+/* Answer the request for the echo URL `a_uri' with the echo page: its element `echo' shows the
+   method, a line break, then the body. WebKitGTK 6.0 (2.52) gives a navigation's request its
+   method and headers but no body (WebKitURIRequest has no body; https cannot take a URI scheme
+   handler), so the body shown is empty. */
+static void sbg_answer_echo (sbg_engine_t *a_engine, const char *a_uri, const char *a_method) {
+    char *l_method = sbg_html_text (a_method ? a_method : "GET");
+    char *l_page = g_strdup_printf ("<html><head><title>echo</title></head><body><pre id=\"echo\">%s\n</pre></body></html>", l_method);
+    sbg_log ("echo uri=%.200s method=%s (no body: WebKitGTK does not expose it)", a_uri, a_method ? a_method : "");
+    sbg_set_pass (a_engine, a_uri);
+    webkit_web_view_load_html (a_engine->view, l_page, a_uri);
+    g_free (l_page);
+    g_free (l_method);
+}
+
 /* Answer held decision `a_number' of engine `a_engine': use it if `a_allow', else ignore it. */
 static void sbg_decide (int a_engine, int a_number, int a_allow) {
     sbg_engine_t *l_engine = sbg_engine (a_engine);
-    int i;
-    for (i = 0; i < SBG_MAX_HELD; i++) {
-        if (sbg_held[i].in_use && sbg_held[i].engine == a_engine && sbg_held[i].number == a_number) {
-            sbg_held[i].in_use = 0;
-            sbg_log ("decide engine=%d number=%d allow=%d", a_engine, a_number, a_allow);
-            if (a_allow && l_engine && !l_engine->disposing) {
-                l_engine->pass_active = 1;
-                webkit_policy_decision_use (sbg_held[i].decision);
-            } else {
-                webkit_policy_decision_ignore (sbg_held[i].decision);
-            }
-            g_object_unref (sbg_held[i].decision);
-            sbg_held[i].decision = NULL;
+    sbg_held_t *l_held = sbg_held_entry (a_engine, a_number);
+    if (!l_held) { return; }
+    sbg_log ("decide engine=%d number=%d allow=%d", a_engine, a_number, a_allow);
+    if (a_allow && l_engine && !l_engine->disposing) {
+        if (l_held->echo) {
+            webkit_policy_decision_ignore (l_held->decision);
+            sbg_answer_echo (l_engine, l_held->uri, l_held->method);
+        } else {
+            l_engine->pass_active = 1;
+            webkit_policy_decision_use (l_held->decision);
         }
+    } else {
+        webkit_policy_decision_ignore (l_held->decision);
     }
+    sbg_release_held (l_held);
 }
 
 /* Ignore and release every decision engine `a_engine' holds. */
@@ -366,10 +480,8 @@ static void sbg_ignore_held (int a_engine) {
     int i;
     for (i = 0; i < SBG_MAX_HELD; i++) {
         if (sbg_held[i].in_use && sbg_held[i].engine == a_engine) {
-            sbg_held[i].in_use = 0;
             webkit_policy_decision_ignore (sbg_held[i].decision);
-            g_object_unref (sbg_held[i].decision);
-            sbg_held[i].decision = NULL;
+            sbg_release_held (&sbg_held[i]);
         }
     }
 }
@@ -410,23 +522,83 @@ static int sbg_take_pass (sbg_engine_t *a_engine, const char *a_uri) {
     return l_result;
 }
 
+/* Let held decision `a_held' through without asking: an iframe's navigation its parent started. */
+static void sbg_let_through (sbg_engine_t *a_engine, sbg_held_t *a_held) {
+    sbg_log ("not asked (the parent set an iframe's src) uri=%.200s", a_held->uri);
+    if (a_held->echo) {
+        webkit_policy_decision_ignore (a_held->decision);
+        sbg_answer_echo (a_engine, a_held->uri, a_held->method);
+    } else {
+        webkit_policy_decision_use (a_held->decision);
+    }
+    sbg_release_held (a_held);
+}
+
+/* The page's answer about a held navigation that had no hint: for type OTHER, is its URL the
+   src of an iframe on the page (one the parser or innerHTML made, loading its first document)?
+   Then, or with a parent's hint that came meanwhile, it is the parent's, not asked; with a
+   frame's own hint that came meanwhile it is asked as an iframe's; else as the main frame's. */
+static void sbg_on_classified (GObject *a_view, GAsyncResult *a_result, gpointer a_data) {
+    sbg_evaluation_t *l_query = (sbg_evaluation_t *) a_data;
+    sbg_engine_t *l_engine = sbg_engine (l_query->engine);
+    GError *l_error = NULL;
+    JSCValue *l_value;
+    sbg_held_t *l_held;
+    int l_is_src = 0;
+    l_value = webkit_web_view_evaluate_javascript_finish (WEBKIT_WEB_VIEW (a_view), a_result, &l_error);
+    if (l_value) {
+        l_is_src = jsc_value_is_boolean (l_value) && jsc_value_to_boolean (l_value);
+        g_object_unref (l_value);
+    }
+    if (l_error) { g_error_free (l_error); }
+    if (l_engine && !l_engine->disposing && l_engine->serial == l_query->serial) {
+        l_held = sbg_held_entry (l_query->engine, l_query->ticket);
+        if (l_held) {
+            if (l_is_src || sbg_take_hint (l_engine, SBG_HINT_PARENT, l_held->uri)) {
+                sbg_take_hint (l_engine, SBG_HINT_FRAME, l_held->uri);
+                sbg_let_through (l_engine, l_held);
+            } else {
+                sbg_push (l_query->engine, SBG_EVENT_NAVIGATING, l_held->number, l_held->kind,
+                          sbg_take_hint (l_engine, SBG_HINT_FRAME, l_held->uri) ? 0 : 1, l_held->uri, NULL, NULL);
+            }
+        }
+    }
+    g_free (l_query);
+}
+
 /* decide-policy: navigation actions are held for Eiffel while deciding; new-window actions
-   are ignored and reported; responses keep WebKit's default. */
+   are ignored and reported; responses keep WebKit's default.
+
+   Which frame: WebKitGTK 6.0's navigation action has no frame and no source frame. Its frame
+   name is the target frame's name (a link's target), measured NULL for the main frame and for
+   unnamed and named iframes alike; the request's headers do not differ either. So the
+   engine's frame script (`Sbg_frame_script', every frame) tells the UI process first, on its
+   own channel: a frame starting a navigation of its own (a link or a form in it) and a page
+   setting an iframe's src. A hint can come just after the policy request, so a navigation
+   without one waits for one round trip to the page (sbg_on_classified) before it is told.
+   - about:srcdoc, or a parent's hint: an iframe navigation its parent started, not asked;
+   - type OTHER whose URL is the src of an iframe on the page (the parser's): the same;
+   - a frame's own hint: asked, not in the main frame;
+   - otherwise: the main frame's, asked. An iframe's script setting its own location gives
+     no hint (Location cannot be wrapped), so it is reported as the main frame's. */
 static gboolean sbg_on_decide_policy (WebKitWebView *a_view, WebKitPolicyDecision *a_decision,
                                       WebKitPolicyDecisionType a_type, gpointer a_data) {
     sbg_engine_t *l_engine = sbg_live (a_data);
     int l_id = GPOINTER_TO_INT (a_data);
     WebKitNavigationAction *l_action;
-    const char *l_uri, *l_frame;
-    int l_number, l_kind, l_main;
+    WebKitNavigationType l_type;
+    const char *l_uri, *l_method;
+    char *l_json, *l_script;
+    sbg_evaluation_t *l_query;
+    int l_number, l_kind, l_echo;
     if (!l_engine) { return FALSE; }
     if (a_type == WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION) {
         l_action = webkit_navigation_policy_decision_get_navigation_action (WEBKIT_NAVIGATION_POLICY_DECISION (a_decision));
         l_uri = sbg_action_uri (l_action);
-        l_frame = webkit_navigation_action_get_frame_name (l_action);
-        sbg_log ("decide-policy navigation engine=%d type=%d frame=%s%s%s gesture=%d redirect=%d pass=%s deciding=%d uri=%.200s",
-                 l_id, (int) webkit_navigation_action_get_navigation_type (l_action),
-                 l_frame ? "\"" : "", l_frame ? l_frame : "NULL", l_frame ? "\"" : "",
+        l_type = webkit_navigation_action_get_navigation_type (l_action);
+        l_method = webkit_uri_request_get_http_method (webkit_navigation_action_get_request (l_action));
+        sbg_log ("decide-policy navigation engine=%d type=%d method=%s gesture=%d redirect=%d pass=%s deciding=%d uri=%.200s",
+                 l_id, (int) l_type, l_method ? l_method : "-",
                  (int) webkit_navigation_action_is_user_gesture (l_action),
                  (int) webkit_navigation_action_is_redirect (l_action),
                  l_engine->pass_url ? l_engine->pass_url : "-", l_engine->deciding, l_uri);
@@ -436,19 +608,43 @@ static gboolean sbg_on_decide_policy (WebKitWebView *a_view, WebKitPolicyDecisio
         if (l_engine->pass_active && webkit_navigation_action_is_redirect (l_action)) {
             return FALSE;   /* a redirect of a load already let through */
         }
+        l_echo = sbg_is_echo (l_engine, l_uri);
         if (!l_engine->deciding) {
+            if (l_echo) {
+                webkit_policy_decision_ignore (a_decision);
+                sbg_answer_echo (l_engine, l_uri, l_method);
+                return TRUE;
+            }
             return FALSE;   /* no handler: WebKit's default, allow, with no event */
         }
-        l_number = sbg_hold (l_id, a_decision);
+        if (strcmp (l_uri, "about:srcdoc") == 0) {
+            return FALSE;   /* an iframe's srcdoc: its parent's navigation, not asked */
+        }
+        l_kind = sbg_navigation_kind (l_type);
+        l_number = sbg_hold (l_id, a_decision, l_kind, l_uri, l_method, l_echo);
         if (l_number == 0) {
             return FALSE;   /* no room to hold it: allowed, as with no handler */
         }
-        l_kind = sbg_navigation_kind (webkit_navigation_action_get_navigation_type (l_action));
-            /* WebKitGTK 6.0 has no main-frame flag. The frame name is the target frame's name
-               (a link's target), measured NULL for the main frame and for an unnamed and a
-               named iframe alike, so every navigation reports main frame (spec 4.8). */
-        l_main = (l_frame == NULL || l_frame[0] == '\0') ? 1 : 0;
-        sbg_push (l_id, SBG_EVENT_NAVIGATING, l_number, l_kind, l_main, l_uri, NULL, NULL);
+        if (sbg_take_hint (l_engine, SBG_HINT_PARENT, l_uri)) {
+            sbg_take_hint (l_engine, SBG_HINT_FRAME, l_uri);
+            sbg_let_through (l_engine, sbg_held_entry (l_id, l_number));
+        } else if (sbg_take_hint (l_engine, SBG_HINT_FRAME, l_uri)) {
+            sbg_push (l_id, SBG_EVENT_NAVIGATING, l_number, l_kind, 0, l_uri, NULL, NULL);
+        } else if (l_engine->has_page) {
+            l_json = sbg_json_string (l_uri);
+            l_script = g_strdup_printf ("%s && (typeof window.__sb_gtk_is_frame_src === \"function\") && window.__sb_gtk_is_frame_src (%s)",
+                                        l_type == WEBKIT_NAVIGATION_TYPE_OTHER ? "true" : "false", l_json);
+            l_query = g_new0 (sbg_evaluation_t, 1);
+            l_query->engine = l_id;
+            l_query->serial = l_engine->serial;
+            l_query->ticket = l_number;
+            webkit_web_view_evaluate_javascript (l_engine->view, l_script, -1, NULL, NULL, l_engine->cancellable,
+                                                 sbg_on_classified, l_query);
+            g_free (l_script);
+            g_free (l_json);
+        } else {
+            sbg_push (l_id, SBG_EVENT_NAVIGATING, l_number, l_kind, 1, l_uri, NULL, NULL);
+        }
         return TRUE;
     } else if (a_type == WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION) {
         l_action = webkit_navigation_policy_decision_get_navigation_action (WEBKIT_NAVIGATION_POLICY_DECISION (a_decision));
@@ -558,6 +754,87 @@ static void sbg_on_message (WebKitUserContentManager *a_manager, JSCValue *a_val
     g_free (l_args);
 }
 
+/* The engine's own script, at the start of every document in every frame, in the page's world:
+   it tells the UI process, on the channel sb_gtk_frame and ahead of WebKit's policy request
+   (the same connection, in order), what decide-policy cannot see (sbg_on_decide_policy):
+   - in an iframe, each link click and form submission it starts in itself, as {frame: url}
+     (sent as the click or submit event ends, before the navigation starts: the Navigation
+     API's navigate event was measured to fire only after the policy decision);
+   - in any page, an iframe's src set by script (the src property, setAttribute) as {parent: url};
+   - `__sb_gtk_is_frame_src (url)': is `url' the src of an iframe in this page (or in a
+     same-origin iframe inside it)? */
+static const char *Sbg_frame_script =
+"(() => {\n"
+"  if (window.__sb_gtk_frames) { return; }\n"
+"  Object.defineProperty (window, \"__sb_gtk_frames\", {value: true});\n"
+"  const post = (message) => {\n"
+"    try { window.webkit.messageHandlers.sb_gtk_frame.postMessage (message); } catch (e) { }\n"
+"  };\n"
+"  const absolute = (url) => { try { return new URL (String (url), document.baseURI).href; } catch (e) { return String (url); } };\n"
+"  if (window !== window.top) {\n"
+"    const own = (target) => { const t = String (target || \"\"); return t === \"\" || t === \"_self\"; };\n"
+"    window.addEventListener (\"click\", (event) => {\n"
+"      const link = event.target && event.target.closest ? event.target.closest (\"a[href]\") : null;\n"
+"      if (link && !event.defaultPrevented && own (link.target)) { post ({frame: link.href}); }\n"
+"    });\n"
+"    const form_url = (form, submitter) => {\n"
+"      const action = (submitter && submitter.hasAttribute (\"formaction\")) ? submitter.formAction : form.action;\n"
+"      const method = String ((submitter && submitter.hasAttribute (\"formmethod\") && submitter.formMethod) || form.method || \"get\").toLowerCase ();\n"
+"      if (method !== \"get\") { return action; }\n"
+"      const url = new URL (action);\n"
+"      url.search = new URLSearchParams (submitter ? new FormData (form, submitter) : new FormData (form)).toString ();\n"
+"      return url.href;\n"
+"    };\n"
+"    window.addEventListener (\"submit\", (event) => {\n"
+"      const form = event.target;\n"
+"      if (!event.defaultPrevented && form && own ((event.submitter && event.submitter.formTarget) || form.target)) {\n"
+"        try { post ({frame: form_url (form, event.submitter || null)}); } catch (e) { }\n"
+"      }\n"
+"    });\n"
+"  }\n"
+"  const told = (element, value) => {\n"
+"    if (element instanceof HTMLIFrameElement) { post ({parent: absolute (value)}); }\n"
+"  };\n"
+"  const source = Object.getOwnPropertyDescriptor (HTMLIFrameElement.prototype, \"src\");\n"
+"  if (source && source.set) {\n"
+"    Object.defineProperty (HTMLIFrameElement.prototype, \"src\", {configurable: true, enumerable: source.enumerable,\n"
+"      get: source.get, set (value) { told (this, value); source.set.call (this, value); }});\n"
+"  }\n"
+"  const set_attribute = Element.prototype.setAttribute;\n"
+"  Element.prototype.setAttribute = function (name, value) {\n"
+"    if (String (name).toLowerCase () === \"src\") { told (this, value); }\n"
+"    return set_attribute.call (this, name, value);\n"
+"  };\n"
+"  const is_src = (doc, url) => {\n"
+"    for (const element of doc.querySelectorAll (\"iframe, frame\")) {\n"
+"      if (element.src === url) { return true; }\n"
+"      let inner = null;\n"
+"      try { inner = element.contentDocument; } catch (e) { }\n"
+"      if (inner && is_src (inner, url)) { return true; }\n"
+"    }\n"
+"    return false;\n"
+"  };\n"
+"  Object.defineProperty (window, \"__sb_gtk_is_frame_src\", {value: (url) => is_src (document, url)});\n"
+"}) ();\n";
+
+/* sb_gtk_frame: the frame script's {frame: url} or {parent: url}. */
+static void sbg_on_frame_hint (WebKitUserContentManager *a_manager, JSCValue *a_value, gpointer a_data) {
+    sbg_engine_t *l_engine = sbg_live (a_data);
+    char *l_url;
+    if (!l_engine || !a_value || !jsc_value_is_object (a_value)) { return; }
+    if (jsc_value_object_has_property (a_value, "frame")) {
+        l_url = sbg_property_text (a_value, "frame");
+        sbg_log ("hint frame engine=%d url=%.200s", GPOINTER_TO_INT (a_data), l_url);
+        if (l_url[0]) { sbg_add_hint (l_engine, SBG_HINT_FRAME, l_url); }
+        g_free (l_url);
+    } else if (jsc_value_object_has_property (a_value, "parent")) {
+        l_url = sbg_property_text (a_value, "parent");
+        sbg_log ("hint parent engine=%d url=%.200s", GPOINTER_TO_INT (a_data), l_url);
+        if (l_url[0]) { sbg_add_hint (l_engine, SBG_HINT_PARENT, l_url); }
+        g_free (l_url);
+    }
+}
+
 /* close-request: queue `closed' and keep the window; `dispose' destroys it. */
 static gboolean sbg_on_close_request (GtkWindow *a_window, gpointer a_data) {
     sbg_engine_t *l_engine = sbg_live (a_data);
@@ -587,17 +864,19 @@ static void sbg_reload_scripts (sbg_engine_t *a_engine) {
     webkit_user_content_manager_remove_all_scripts (a_engine->content_manager);
     for (i = 0; i < SBG_MAX_SCRIPTS; i++) {
         if (a_engine->scripts[i].in_use) {
-            l_script = webkit_user_script_new (a_engine->scripts[i].source, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
-                                               WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
+            l_script = webkit_user_script_new (a_engine->scripts[i].source,
+                a_engine->scripts[i].all_frames ? WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES : WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+                WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
             webkit_user_content_manager_add_script (a_engine->content_manager, l_script);
             webkit_user_script_unref (l_script);
         }
     }
 }
 
-/* Run `a_script' at the start of every page (top frame, document start), kept under `a_name'
-   (NULL or empty for a script kept for good), and on the page shown now if `a_now'. */
-static void sbg_add_script (int a_id, const char *a_name, const char *a_script, int a_now) {
+/* Run `a_script' at the start of every page (document start; in every frame if `a_all_frames',
+   else in the top frame), kept under `a_name' (NULL or empty for a script kept for good), and on
+   the page shown now if `a_now'. */
+static void sbg_add_script (int a_id, const char *a_name, const char *a_script, int a_now, int a_all_frames) {
     sbg_engine_t *l_engine = sbg_engine (a_id);
     WebKitUserScript *l_script;
     int i, l_slot = -1;
@@ -620,8 +899,10 @@ static void sbg_add_script (int a_id, const char *a_name, const char *a_script, 
     l_engine->scripts[l_slot].in_use = 1;
     l_engine->scripts[l_slot].name = (a_name && a_name[0]) ? g_strdup (a_name) : NULL;
     l_engine->scripts[l_slot].source = g_strdup (a_script);
-    l_script = webkit_user_script_new (a_script, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
-                                       WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
+    l_engine->scripts[l_slot].all_frames = a_all_frames;
+    l_script = webkit_user_script_new (a_script,
+        a_all_frames ? WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES : WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL);
     webkit_user_content_manager_add_script (l_engine->content_manager, l_script);
     webkit_user_script_unref (l_script);
     if (a_now) { sbg_eval (a_id, a_script); }
@@ -714,15 +995,12 @@ static void sbg_set_html_with_base (int a_id, const char *a_html, const char *a_
     webkit_web_view_load_html (l_engine->view, a_html, a_base);
 }
 
-/* Load `a_html' as the page, at a URL of its own under the reserved name
-   simple-browser.invalid (as on Windows), which never reaches the network. */
-static void sbg_set_html (int a_id, const char *a_html) {
+/* Test hook: answer every request for `a_url' with the echo page (sbg_answer_echo). */
+static void sbg_set_echo (int a_id, const char *a_url) {
     sbg_engine_t *l_engine = sbg_engine (a_id);
-    char l_url[96];
-    if (!l_engine) { return; }
-    l_engine->page_serial = l_engine->page_serial + 1;
-    g_snprintf (l_url, sizeof (l_url), "https://simple-browser.invalid/page-%d", l_engine->page_serial);
-    sbg_set_html_with_base (a_id, a_html, l_url);
+    if (!l_engine || !a_url) { return; }
+    g_free (l_engine->echo_url);
+    l_engine->echo_url = sbg_normalized_uri (a_url);
 }
 
 static void sbg_set_deciding (int a_id, int a_on) {
@@ -1011,7 +1289,10 @@ static int sbg_create (int a_ephemeral, int a_debug, void *a_parent) {
                                     : g_object_ref (webkit_network_session_get_default ());
     l_engine->content_manager = webkit_user_content_manager_new ();
     webkit_user_content_manager_register_script_message_handler (l_engine->content_manager, "sb", NULL);
+    webkit_user_content_manager_register_script_message_handler (l_engine->content_manager, "sb_gtk_frame", NULL);
     g_signal_connect (l_engine->content_manager, "script-message-received::sb", G_CALLBACK (sbg_on_message), l_data);
+    g_signal_connect (l_engine->content_manager, "script-message-received::sb_gtk_frame", G_CALLBACK (sbg_on_frame_hint), l_data);
+    sbg_add_script (l_id, NULL, Sbg_frame_script, 0, 1);
     l_engine->view = WEBKIT_WEB_VIEW (g_object_new (WEBKIT_TYPE_WEB_VIEW,
         "network-session", l_engine->session,
         "user-content-manager", l_engine->content_manager,
@@ -1074,6 +1355,7 @@ static void sbg_dispose (int a_id) {
     if (l_engine->content_manager) {
         g_signal_handlers_disconnect_by_data (l_engine->content_manager, l_data);
         webkit_user_content_manager_unregister_script_message_handler (l_engine->content_manager, "sb", NULL);
+        webkit_user_content_manager_unregister_script_message_handler (l_engine->content_manager, "sb_gtk_frame", NULL);
     }
     if (l_engine->owns_window) {
         if (l_engine->window) {
@@ -1096,7 +1378,9 @@ static void sbg_dispose (int a_id) {
         g_free (l_engine->scripts[i].name);
         g_free (l_engine->scripts[i].source);
     }
+    for (i = 0; i < SBG_MAX_HINTS; i++) { g_free (l_engine->hints[i].uri); }
     g_free (l_engine->pass_url);
+    g_free (l_engine->echo_url);
     sbg_drop_events (a_id);
     sbg_free_event (l_engine->current);
     {
