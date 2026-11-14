@@ -15,7 +15,7 @@ deferred class
 
 feature -- Constants
 
-	Sb_version: STRING = "0.1.0"
+	Sb_version: STRING = "0.2.0"
 			-- Library version.
 
 	Sb_library_name: STRING = "simple_browser"
