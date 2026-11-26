@@ -4,6 +4,14 @@
 
 simple_browser off Windows, the shared code and the Windows engine (SIMPLE_BROWSER_SPEC.md, port-coordination #72).
 
+### Security
+- 2026-11-26: `lib/WebView2Loader.dll` 1.0.1150.38 to **1.0.4370.26** and `Clib/windows/WebView2.h`
+  to the same SDK (Microsoft's NuGet package `Microsoft.Web.WebView2` 1.0.4370.26, 2026-11-21;
+  package SHA-512 as NuGet's catalog publishes it; the DLL is signed by Microsoft Corporation).
+  webview.dll loads the loader by name (`GetProcAddress`), so the new export order does not
+  matter. Removed `lib/WebView2LoaderStatic.lib`: nothing links it (webview.dll has its own
+  loader for when the DLL is absent). simple_scholar's `bin/` carries the same loader.
+
 ### Added
 - `SIMPLE_BROWSER`: `evaluate` (results of a script as JSON, promises awaited), `on_navigation`
   (`SB_NAVIGATION`: url, kind, main frame; True allows), `on_new_window`, `on_title`, `on_loaded`,
